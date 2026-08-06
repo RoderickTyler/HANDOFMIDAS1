@@ -10,7 +10,8 @@ Run locally:
     streamlit run streamlit_app.py
 
 Deploy free on Streamlit Community Cloud: point it at this file, add
-FRED_API_KEY (and optionally GOLDAPI_KEY) under App settings -> Secrets.
+FRED_API_KEY under App settings -> Secrets. (The live XAUUSD spot quote
+uses gold-api.com, which needs no key at all.)
 """
 
 import os
@@ -114,13 +115,11 @@ if not config.FRED_API_KEY:
 else:
     st.sidebar.success("FRED_API_KEY loaded.")
 
-if not config.GOLDAPI_KEY:
-    st.sidebar.info("GOLDAPI_KEY not set (optional) -- live XAUUSD spot row will show n/a.")
-
 st.sidebar.markdown("---")
 st.sidebar.caption(
     "Data: Yahoo Finance (gold/DXY/VIX), FRED (yields), IMF (reserves), "
-    "CFTC (COT), Caldara-Iacoviello GPR index. All free."
+    "CFTC (COT), Caldara-Iacoviello GPR index, gold-api.com (XAUUSD spot). "
+    "All free, no key needed except FRED."
 )
 
 # ---------------------------------------------------------------------------

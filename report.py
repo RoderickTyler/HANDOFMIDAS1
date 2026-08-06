@@ -38,9 +38,9 @@ def build_report(summary: dict, flags: dict) -> str:
             diff = xauusd - gc_f
             diff_pct = (diff / gc_f * 100) if gc_f else 0
             diff_note = f" -- {diff:+.2f} ({diff_pct:+.2f}%) vs. GC=F above"
-        table.append(["Gold (XAUUSD spot, GoldAPI.io)", fmt(xauusd), f"REAL spot quote, live API{diff_note}"])
+        table.append(["Gold (XAUUSD spot, gold-api.com)", fmt(xauusd), f"REAL spot quote, live API{diff_note}"])
     else:
-        table.append(["Gold (XAUUSD spot)", "n/a", "GOLDAPI_KEY not set -- see README to add a free key"])
+        table.append(["Gold (XAUUSD spot)", "n/a", "Spot fetch failed this run (rare -- source needs no key)"])
 
     table += [
         ["DXY", fmt(summary.get("dxy")), fmt(summary.get("dxy_chg_1d"), 2, " (1d)")],
@@ -60,7 +60,7 @@ def build_report(summary: dict, flags: dict) -> str:
     lines.append("  * GC=F futures: what every other calculation in this system uses (regime model,")
     lines.append("    factor attribution, divergence flags, etc.) -- consistent across the whole system,")
     lines.append("    but not identical to a live spot quote you'd see on a broker's chart.")
-    lines.append("  * XAUUSD spot: pulled fresh from GoldAPI.io's live API each run -- this is the number")
+    lines.append("  * XAUUSD spot: pulled fresh from gold-api.com's live API each run -- this is the number")
     lines.append("    to compare against your actual trading platform's spot price.")
 
     lines.append("\n--- DIVERGENCE FLAGS (where the textbook model may be breaking) ---")

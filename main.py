@@ -66,14 +66,13 @@ def run_daily_briefing(period="1y"):
                   f"{complete_rows.index.min().date()} to {complete_rows.index.max().date()} "
                   f"({len(complete_rows)} days). This is the range models below actually use.")
 
-    print("Fetching real spot XAUUSD (GoldAPI.io, optional -- for comparison against GC=F)...")
+    print("Fetching real spot XAUUSD (gold-api.com, free, no key needed -- for comparison against GC=F)...")
     try:
         xauusd_result = spot_gold.fetch_xauusd_spot()
         if xauusd_result is not None:
             summary["xauusd_spot"] = xauusd_result["price"]
         else:
-            if not fetch_data.config.GOLDAPI_KEY:
-                print("  [info] GOLDAPI_KEY not set -- skipping. See README to add a free key.")
+            print("  [info] Spot fetch returned nothing this run -- skipping.")
     except Exception as e:
         print(f"[warn] Spot XAUUSD fetch failed this run (non-fatal): {e}")
 

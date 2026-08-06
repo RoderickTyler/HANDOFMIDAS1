@@ -40,13 +40,9 @@ def _get_secret(name: str, default: str = "") -> str:
 
 FRED_API_KEY = _get_secret("FRED_API_KEY")
 
-# Optional: real spot XAUUSD via GoldAPI.io, purely for comparison against
-# the GC=F futures price the rest of this system uses. Unlike FRED, this
-# needs a free signup (no card required) at https://www.goldapi.io -- add
-# the key to your .env file (local) or Streamlit secrets (deployed) as
-# GOLDAPI_KEY=your_key_here. If not set, this feature is skipped
-# gracefully; everything else works exactly as before.
-GOLDAPI_KEY = _get_secret("GOLDAPI_KEY")
+# Real spot XAUUSD (for comparison against the GC=F futures price the rest
+# of this system uses) comes from gold-api.com, which needs no key at all
+# -- see spot_gold.py. No config needed here anymore.
 
 # ---- yfinance tickers (no key needed) ----
 YF_TICKERS = {

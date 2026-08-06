@@ -48,19 +48,10 @@ Every time you run it, you get:
    ```
    FRED_API_KEY=your_key_here
    ```
-   (Everything else — yfinance for gold/DXY/VIX, IMF's SDMX API for
-   central bank reserves, CFTC's COT data, and the Iacoviello
-   Geopolitical Risk Index — needs no key at all.)
-
-5. **Optional:** for a real spot XAUUSD quote (to compare against the
-   GC=F futures price the rest of the system uses), sign up free at
-   https://www.goldapi.io (no card required), then add to the same
-   `.env` file:
-   ```
-   GOLDAPI_KEY=your_key_here
-   ```
-   If you skip this, the briefing still works exactly the same — it just
-   shows "n/a" for the spot row instead of a live quote.
+   (Everything else needs no key at all: yfinance for gold/DXY/VIX, IMF's
+   SDMX API for central bank reserves, CFTC's COT data, the Iacoviello
+   Geopolitical Risk Index, and gold-api.com for the real XAUUSD spot
+   quote shown alongside the GC=F futures price.)
 
 ## Daily use
 
@@ -95,7 +86,7 @@ Central Bank Reserves, and the thesis Journal (log/score from the browser).
 
 ```
 pip install -r requirements.txt
-cp .env.example .env        # then fill in FRED_API_KEY (and GOLDAPI_KEY if you have it)
+cp .env.example .env        # then fill in FRED_API_KEY
 streamlit run streamlit_app.py
 ```
 
@@ -111,11 +102,10 @@ Opens at `http://localhost:8501`.
    and paste:
    ```
    FRED_API_KEY = "your_key_here"
-   GOLDAPI_KEY = "your_key_here"
    ```
-   (`GOLDAPI_KEY` is optional — leave it out and the spot-price row just
-   shows n/a.) `config.py` reads secrets from the environment first, then
-   falls back to `st.secrets`, so this works without any code changes.
+   `config.py` reads secrets from the environment first, then falls back
+   to `st.secrets`, so this works without any code changes. (The XAUUSD
+   spot quote uses gold-api.com, which needs no key.)
 5. Deploy. You'll get a public URL like `https://<your-app>.streamlit.app`.
 
 The dashboard caches each data source for 15 minutes (`st.cache_data`, see
@@ -169,6 +159,8 @@ judgment" skill: knowing which of your own instincts to trust.
 | 2Y/10Y nominal yields, 10Y real (TIPS) yield, curve spread | FRED (`fredapi`) | Yes, free |
 | Central bank gold reserves | IMF SDMX public API | No |
 | Geopolitical Risk Index | Caldara & Iacoviello (Fed economists), matteoiacoviello.com | No |
+| Real XAUUSD spot quote | gold-api.com | No |
+| COT positioning (Managed Money) | CFTC | No |
 
 ## Notes / known limitations
 
