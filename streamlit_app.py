@@ -381,6 +381,38 @@ with tabs[4]:
 # Tab: Central Bank Reserves
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Reserves pivot helper (mirrors main.py's CLI table, but returns a real
+# DataFrame instead of a preformatted string, so it renders as an actual
+# table with all countries as columns -- not just a tail() of one long list)
+# ---------------------------------------------------------------------------
+
+def _parse_imf_period(period_str):
+    s = str(period_str).replace("M", "")
+    try:
+        return pd.Period(s, freq="M")
+    except Exception:
+        return None
+
+
+def pivot_reserves_by_country(reserves_df, n_periods=12, value_fmt="usd_billions"):
+    country_col, period_col, value_col, _ = reserves_utils.get_columns(reserves_df)
+    if not all([country_col, period_col, value_col]):
+        return None
+
+    filtered = reserves_utils.select_single_sector_per_country(reserves_df).copy()
+    filtered["_period"] = filtered[period_col].apply(_parse_imf_period)
+    filtered = filtered.dropna(subset=["_period"])
+
+    pivot = filtered.pivot_table(index="_period", columns=country_col, values=value_col, aggfunc="last")
+    pivot = pivot.sort_index().tail(n_periods)
+    pivot.index = pivot.index.astype(str)
+
+    if value_fmt == "usd_billions":
+        pivot = pivot.apply(lambda col: col.map(lambda v: v / 1e9 if pd.notna(v) else None))
+    return pivot
+
+
 with tabs[5]:
     st.subheader("Central bank gold reserves (IMF IRFCL)")
     reserves_df = raw.get("reserves")
@@ -391,18 +423,20 @@ with tabs[5]:
         st.info("Reserves data unavailable this run (IMF API can be flaky). Manual fallback: "
                 "https://www.gold.org/goldhub/data/gold-reserves-by-country")
     else:
-        st.caption("USD VALUE (mark-to-market) \u2014 moves from both actual buying/selling AND gold's own price.")
-        country_col, period_col, value_col, _ = reserves_utils.get_columns(reserves_df)
-        if all([country_col, period_col, value_col]):
-            filtered = reserves_utils.select_single_sector_per_country(reserves_df).copy()
-            st.dataframe(filtered[[country_col, period_col, value_col]].tail(50), use_container_width=True)
+        st.caption("USD VALUE, $ billions (mark-to-market) \u2014 moves from both actual buying/selling AND gold's own price.")
+        usd_pivot = pivot_reserves_by_country(reserves_df, n_periods=12, value_fmt="usd_billions")
+        if usd_pivot is not None:
+            st.dataframe(usd_pivot.style.format("${:,.2f}B", na_rep="-"), use_container_width=True)
+        else:
+            st.warning("Could not identify country/period/value columns in the reserves data.")
 
     if reserves_vol_df is not None and not reserves_vol_df.empty:
         st.caption(f"PHYSICAL QUANTITY ({reserves_vol_unit or 'unit not identified'}) \u2014 immune to price moves.")
-        country_col, period_col, value_col, _ = reserves_utils.get_columns(reserves_vol_df)
-        if all([country_col, period_col, value_col]):
-            filtered_vol = reserves_utils.select_single_sector_per_country(reserves_vol_df).copy()
-            st.dataframe(filtered_vol[[country_col, period_col, value_col]].tail(50), use_container_width=True)
+        vol_pivot = pivot_reserves_by_country(reserves_vol_df, n_periods=12, value_fmt="plain")
+        if vol_pivot is not None:
+            st.dataframe(vol_pivot.style.format("{:,.1f}", na_rep="-"), use_container_width=True)
+        else:
+            st.warning("Could not identify country/period/value columns in the volume data.")
     else:
         st.info("Could not fetch physical quantity (volume) gold reserves this run.")
 
