@@ -1,0 +1,16 @@
+# secrets
+.env
+.streamlit/secrets.toml
+
+# data generated at runtime (price cache, journal, reserves history)
+data/*.csv
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
