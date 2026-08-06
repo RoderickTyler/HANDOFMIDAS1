@@ -238,7 +238,14 @@ def _fetch_irfcl_gold_series(prefer: str, countries=None):
         return pd.DataFrame(), None
 
     try:
-        imfp.imf_app_name("gold_macro_daily_briefing")
+        # imfp renamed this function from imf_app_name -> set_imf_app_name when
+        # it rewrote itself for IMF's new SDMX 3.0 API (the old one no longer
+        # exists). Try the current name first, fall back to the old one for
+        # anyone pinned to an older imfp version.
+        if hasattr(imfp, "set_imf_app_name"):
+            imfp.set_imf_app_name("gold_macro_daily_briefing")
+        elif hasattr(imfp, "imf_app_name"):
+            imfp.imf_app_name("gold_macro_daily_briefing")
     except Exception:
         pass
 
