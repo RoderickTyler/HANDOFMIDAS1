@@ -138,20 +138,23 @@ def load_gex_live_refs():
     return live_gld, live_xau
 
 
-def find_nearest_gex_clusters(gex_by_strike, spot, window_pct=0.08, magnitude_frac=0.05, top_n=6):
+def find_nearest_gex_clusters(gex_by_strike, spot, window_pct=0.08, magnitude_frac=0.20, top_n=6):
     """
-    Finds strikes CLOSE to spot that still carry non-noise GEX weight --
-    different from result.call_walls/put_walls, which rank by size
-    everywhere in the chain regardless of distance from spot. This answers
-    "what's nearby that could actually matter today", not "what's biggest
-    anywhere in the chain". Proximity is the primary sort; magnitude_frac
-    is only a loose noise filter (default 5% of the window's largest
-    |NetGEX|), not a "must be big" bar -- a modest nearby level should
-    still surface even if a much bigger wall exists further away.
+    Finds strikes CLOSE to spot that ALSO stand out visually (a real
+    concentration of GEX, not just noise) -- different from
+    result.call_walls/put_walls, which rank purely by size everywhere in
+    the chain regardless of distance from spot. This answers "what's
+    nearby AND large enough to matter", not "what's biggest anywhere in
+    the chain" (that's call_walls/put_walls) and not "everything within
+    reach regardless of size" (too lenient a filter just adds noise like
+    a $1-2M strike sitting next to a $25M one).
 
     window_pct: how far from spot to look (fraction of spot price).
+    magnitude_frac: a strike must have |NetGEX| at least this fraction of
+        the largest |NetGEX| within the window (default 20%) to count as
+        a real concentration rather than noise.
     Returns a DataFrame sorted by distance from spot (nearest first), or
-    an empty DataFrame if nothing in the window clears the noise floor.
+    an empty DataFrame if nothing in the window clears the bar.
     """
     if gex_by_strike is None or gex_by_strike.empty:
         return pd.DataFrame()
@@ -665,10 +668,9 @@ with tabs[7]:
 
         st.markdown("##### Self-calculated nearest levels for reference")
         st.caption(
-            "Not necessarily the largest walls in the chain \u2014 these are the CLOSEST "
-            "strikes to spot that still carry meaningful GEX weight, since a nearby "
-            "medium wall can matter more for today's price action than a bigger one "
-            "much further away."
+            "The closest-to-spot strikes that still show a real GEX concentration "
+            "(not just any strike within reach) \u2014 filters out small/noise levels "
+            "so the list favors visually significant bars near spot, not every bar."
         )
         nearest = find_nearest_gex_clusters(gbs, result.spot)
         oz_for_nearest = None
