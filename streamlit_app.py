@@ -32,6 +32,7 @@ import reserves_utils
 import journal
 import spot_gold
 import gex_engine
+import gold_comparison
 
 st.set_page_config(
     page_title="Gold Macro Dashboard",
@@ -685,6 +686,76 @@ with tabs[7]:
             "Compare against 'Spot' above \u2014 if these differ noticeably, the chain "
             "the GEX numbers were computed from is an older snapshot than right now."
         )
+
+        if ticker.upper() == "GLD":
+            st.markdown("#### Spot Gold Equivalent (proxy)")
+            st.caption(
+                "GLD's structure translated into $/oz using GLD price = OzPerShare \u00d7 "
+                "Spot. This is a PROXY \u2014 GLD's own gamma walls converted to spot units "
+                "\u2014 not independently observed COMEX/spot options data. The oz/share "
+                "ratio drifts slowly (fund expenses), so it's re-derived live from "
+                "Live GLD / Live spot each run (cached ~24h so it doesn't jitter) "
+                "rather than pulled from a fixed constant."
+            )
+            try:
+                proxy = gold_comparison.convert_result_to_spot_gold_terms(result)
+                p1, p2, p3 = st.columns(3)
+                p1.metric("Spot Gold Equiv", f"{proxy['spot_gold_equivalent']:.2f}")
+                p2.metric(
+                    "Gamma Flip Equiv",
+                    f"{proxy['gamma_flip_spot_equivalent']:.2f}"
+                    if proxy["gamma_flip_spot_equivalent"] is not None else "not found",
+                )
+                p3.metric("oz/share used", f"{proxy['oz_per_share_used']:.6f}")
+
+                pc1, pc2 = st.columns(2)
+                with pc1:
+                    st.write("**Resistance (call walls, spot-equivalent):**")
+                    st.table(pd.DataFrame(proxy["call_walls_spot_equivalent"], columns=["Spot Level", "GEX"]))
+                with pc2:
+                    st.write("**Support (put walls, spot-equivalent):**")
+                    st.table(pd.DataFrame(proxy["put_walls_spot_equivalent"], columns=["Spot Level", "GEX"]))
+
+                try:
+                    ctx = result.contextual_levels()
+                    oz = proxy["oz_per_share_used"]
+                    atm_strike, atm_gex = ctx["atm_pin"]
+                    largest = ctx["largest_wall_overall"]
+                    st.write(
+                        f"**ATM Pin (spot-equivalent):** {atm_strike / oz:.2f}  (GEX {atm_gex:,.0f})"
+                    )
+                    st.write(
+                        f"**Largest wall overall (spot-equivalent):** {largest['strike'] / oz:.2f}  "
+                        f"(GEX {largest['gex']:,.0f}, {largest['side']})"
+                    )
+                    scx1, scx2 = st.columns(2)
+                    with scx1:
+                        st.write("**Resistance (spot-equivalent, above spot):**")
+                        if ctx["resistance"]:
+                            st.table(pd.DataFrame(
+                                [(s / oz, g) for s, g in ctx["resistance"]],
+                                columns=["Spot Level", "GEX"],
+                            ))
+                        else:
+                            st.caption("None found above spot in this chain.")
+                    with scx2:
+                        st.write("**Support (spot-equivalent, below spot):**")
+                        if ctx["support"]:
+                            st.table(pd.DataFrame(
+                                [(s / oz, g) for s, g in ctx["support"]],
+                                columns=["Spot Level", "GEX"],
+                            ))
+                        else:
+                            st.caption("None found below spot in this chain.")
+                except Exception as e:
+                    st.caption(f"Spot-equivalent contextual levels unavailable: {e}")
+            except Exception as e:
+                st.warning(f"Spot gold equivalent conversion unavailable this run: {e}")
+        else:
+            st.caption(
+                f"Spot Gold Equivalent proxy only applies to GLD (converts GLD's share-price "
+                f"structure to $/oz) \u2014 not shown for {ticker}."
+            )
 
         with st.expander("Raw walls (unfiltered by spot, diagnostic)"):
             st.write("**Call walls (largest CallGEX):**")
