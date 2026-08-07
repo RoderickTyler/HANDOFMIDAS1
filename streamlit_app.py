@@ -138,6 +138,39 @@ def load_gex_live_refs():
     return live_gld, live_xau
 
 
+def find_nearest_gex_clusters(gex_by_strike, spot, window_pct=0.08, magnitude_frac=0.05, top_n=6):
+    """
+    Finds strikes CLOSE to spot that still carry non-noise GEX weight --
+    different from result.call_walls/put_walls, which rank by size
+    everywhere in the chain regardless of distance from spot. This answers
+    "what's nearby that could actually matter today", not "what's biggest
+    anywhere in the chain". Proximity is the primary sort; magnitude_frac
+    is only a loose noise filter (default 5% of the window's largest
+    |NetGEX|), not a "must be big" bar -- a modest nearby level should
+    still surface even if a much bigger wall exists further away.
+
+    window_pct: how far from spot to look (fraction of spot price).
+    Returns a DataFrame sorted by distance from spot (nearest first), or
+    an empty DataFrame if nothing in the window clears the noise floor.
+    """
+    if gex_by_strike is None or gex_by_strike.empty:
+        return pd.DataFrame()
+    window = gex_by_strike[
+        (gex_by_strike.index >= spot * (1 - window_pct))
+        & (gex_by_strike.index <= spot * (1 + window_pct))
+    ].copy()
+    if window.empty:
+        return pd.DataFrame()
+    window["AbsNetGEX"] = window["NetGEX"].abs()
+    threshold = window["AbsNetGEX"].max() * magnitude_frac
+    candidates = window[window["AbsNetGEX"] >= threshold].copy()
+    if candidates.empty:
+        return pd.DataFrame()
+    candidates["DistFromSpot"] = candidates.index - spot
+    candidates["AbsDistFromSpot"] = candidates["DistFromSpot"].abs()
+    return candidates.sort_values("AbsDistFromSpot").head(top_n)
+
+
 def load_factor_attribution(signals, reserves_df):
     try:
         return factor_attribution.build_report(signals, reserves_df)
@@ -629,6 +662,43 @@ with tabs[7]:
         else:
             st.bar_chart(gbs[["CallGEX", "PutGEX"]])
         st.caption("Chart zoomed to \u00b115% of spot for readability; raw walls below cover the full chain.")
+
+        st.markdown("##### Self-calculated nearest levels for reference")
+        st.caption(
+            "Not necessarily the largest walls in the chain \u2014 these are the CLOSEST "
+            "strikes to spot that still carry meaningful GEX weight, since a nearby "
+            "medium wall can matter more for today's price action than a bigger one "
+            "much further away."
+        )
+        nearest = find_nearest_gex_clusters(gbs, result.spot)
+        oz_for_nearest = None
+        if ticker.upper() == "GLD":
+            try:
+                oz_for_nearest = gold_comparison.get_oz_per_share()
+            except Exception:
+                oz_for_nearest = None
+        if nearest.empty:
+            st.caption("Nothing near spot cleared the meaningful-size threshold this run.")
+        else:
+            for strike, row in nearest.iterrows():
+                dist = row["DistFromSpot"]
+                side = "above spot (resistance-leaning)" if dist > 0 else "below spot (support-leaning)" if dist < 0 else "essentially AT spot (pin risk)"
+                call_gex, put_gex = row["CallGEX"], row["PutGEX"]
+                if abs(call_gex) > abs(put_gex) * 1.3:
+                    lean = "call-dominant"
+                elif abs(put_gex) > abs(call_gex) * 1.3:
+                    lean = "put-dominant"
+                else:
+                    lean = "mixed call/put"
+                pct_away = (dist / result.spot) * 100
+                line = (
+                    f"**{strike:.2f}** ({pct_away:+.2f}% from spot, {side}, {lean}) \u2014 "
+                    f"NetGEX {row['NetGEX']:,.0f}"
+                )
+                if oz_for_nearest:
+                    spot_equiv = strike / oz_for_nearest
+                    line += f"  \u2192 spot XAUUSD equiv \u2248 **{spot_equiv:,.0f}** (oz/share used {oz_for_nearest:.6f})"
+                st.markdown(line)
 
         st.markdown("#### Contextual levels (spot-aware support/resistance)")
         try:
