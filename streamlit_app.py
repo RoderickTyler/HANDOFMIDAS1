@@ -18,6 +18,7 @@ import os
 from datetime import datetime
 
 import pandas as pd
+import requests
 import streamlit as st
 
 import config
@@ -97,6 +98,52 @@ def load_calendar(days_ahead=14):
 
 
 GEX_CACHE_TTL = 10 * 60  # options data is more time-sensitive than macro data
+
+REGIME_LOG_URL = "https://raw.githubusercontent.com/RoderickTyler/HANDOFMIDAS1/data/logs/regime_log.csv"
+REGIME_LOG_CACHE_TTL = 5 * 60  # the log itself only updates every 15 min; no need to refetch more than this
+
+
+@st.cache_data(ttl=REGIME_LOG_CACHE_TTL, show_spinner=False)
+def load_regime_log():
+    """
+    Fetches the regime history log over plain HTTP from the 'data' branch --
+    deliberately NOT read from the local deployment checkout, so that the
+    GitHub Actions cron committing to that branch every 15 minutes never
+    triggers a Streamlit Cloud redeploy (which only watches 'main').
+    Returns None if the branch/file doesn't exist yet (e.g. before the
+    first Action run) or the fetch fails for any reason.
+    """
+    try:
+        resp = requests.get(REGIME_LOG_URL, timeout=15)
+        if resp.status_code != 200 or not resp.text.strip():
+            return None
+        from io import StringIO
+        df = pd.read_csv(StringIO(resp.text))
+        if df.empty:
+            return None
+        df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, format="ISO8601", errors="coerce")
+        df = df.dropna(subset=["timestamp_utc"]).sort_values("timestamp_utc").reset_index(drop=True)
+        return df if not df.empty else None
+    except Exception:
+        return None
+
+
+def compute_regime_episodes(df):
+    """
+    Collapses consecutive same-state rows into episodes (start, end,
+    duration, state) -- the basis for dwell-time stats and streak length.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["state", "start", "end", "duration_minutes"])
+    d = df.sort_values("timestamp_utc").reset_index(drop=True)
+    d["group"] = (d["top_state"] != d["top_state"].shift()).cumsum()
+    episodes = d.groupby("group").agg(
+        state=("top_state", "first"),
+        start=("timestamp_utc", "first"),
+        end=("timestamp_utc", "last"),
+    ).reset_index(drop=True)
+    episodes["duration_minutes"] = (episodes["end"] - episodes["start"]).dt.total_seconds() / 60
+    return episodes
 
 
 @st.cache_data(ttl=GEX_CACHE_TTL, show_spinner=False)
@@ -251,6 +298,7 @@ if spot_result is not None:
 tabs = st.tabs([
     "Overview", "Regime (HMM)", "COT Positioning", "Factor Attribution",
     "Econ Calendar", "Central Bank Reserves", "Journal", "GEX (Options)",
+    "Regime History",
 ])
 
 # ---------------------------------------------------------------------------
@@ -846,3 +894,86 @@ with tabs[7]:
             st.table(pd.DataFrame(result.put_walls, columns=["Strike", "GEX"]))
     else:
         st.info("Click 'Run / refresh GEX assessment' above to fetch a live chain and compute GEX.")
+
+# ---------------------------------------------------------------------------
+# Tab: Regime History -- reads the log the GitHub Actions cron maintains
+# ---------------------------------------------------------------------------
+
+with tabs[8]:
+    st.subheader("Regime stability over the past week")
+    st.caption(
+        "Logged every 15 minutes, weekdays only, by a separate scheduled job \u2014 "
+        "not the live dashboard's own regime read, which can differ slightly if "
+        "market data has moved since the last log entry. Stored in UTC, shown "
+        "here converted to Singapore time (SGT, UTC+8)."
+    )
+
+    log_df = load_regime_log()
+
+    if log_df is None:
+        st.info(
+            "No regime history yet. This fills in automatically once the "
+            "regime-logger GitHub Action has run at least once (every 15 min, "
+            "weekdays) \u2014 check back after that, or trigger it manually from "
+            "the repo's Actions tab."
+        )
+    else:
+        log_df = log_df.copy()
+        log_df["timestamp_sgt"] = log_df["timestamp_utc"].dt.tz_convert("Asia/Singapore")
+
+        episodes = compute_regime_episodes(log_df)  # duration math is tz-agnostic, uses timestamp_utc internally
+        episodes["start_sgt"] = episodes["start"].dt.tz_convert("Asia/Singapore")
+        episodes["end_sgt"] = episodes["end"].dt.tz_convert("Asia/Singapore")
+
+        latest = log_df.iloc[-1]
+        current_episode = episodes.iloc[-1] if not episodes.empty else None
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Current state (last logged)", latest["top_state"])
+        m1.caption(f"as of {latest['timestamp_sgt'].strftime('%Y-%m-%d %H:%M')} SGT")
+        if current_episode is not None:
+            streak_hrs = current_episode["duration_minutes"] / 60
+            m2.metric("Current streak", f"{streak_hrs:.1f}h")
+        today_sgt = pd.Timestamp.now(tz="Asia/Singapore").normalize()
+        changes_today = int((episodes["start_sgt"].dt.normalize() == today_sgt).sum()) if not episodes.empty else 0
+        m3.metric("Changes today", changes_today)
+        if not episodes.empty:
+            avg_dwell_hrs = episodes["duration_minutes"].mean() / 60
+            m4.metric("Avg dwell time (week)", f"{avg_dwell_hrs:.1f}h")
+
+        st.markdown("#### Timeline (color = regime state)")
+        try:
+            import altair as alt
+            heat_df = log_df.copy()
+            heat_df["date"] = heat_df["timestamp_sgt"].dt.strftime("%Y-%m-%d (%a)")
+            heat_df["time_of_day"] = heat_df["timestamp_sgt"].dt.strftime("%H:%M")
+            chart = alt.Chart(heat_df).mark_rect().encode(
+                x=alt.X("time_of_day:O", title="Time of day (SGT)", sort=None),
+                y=alt.Y("date:O", title=None, sort=None),
+                color=alt.Color(
+                    "top_state:N",
+                    title="Regime",
+                    scale=alt.Scale(
+                        domain=["Declining", "Range", "Rising"],
+                        range=["#E24B4A", "#888780", "#639922"],
+                    ),
+                ),
+                tooltip=["timestamp_sgt:T", "top_state:N", "top_prob:Q"],
+            ).properties(height=28 * heat_df["date"].nunique() + 40)
+            st.altair_chart(chart, use_container_width=True)
+        except Exception as e:
+            st.warning(f"Timeline chart unavailable: {e}")
+
+        st.markdown("#### Changes per day")
+        if not episodes.empty:
+            episodes_by_day = episodes.copy()
+            episodes_by_day["day"] = episodes_by_day["start_sgt"].dt.strftime("%Y-%m-%d (%a)")
+            changes_per_day = episodes_by_day.groupby("day").size().rename("Regime changes")
+            st.bar_chart(changes_per_day)
+        else:
+            st.caption("Not enough history yet to compute changes per day.")
+
+        with st.expander("Raw log (last 100 rows)"):
+            display_df = log_df[["timestamp_sgt", "top_state", "top_prob", "prob_declining", "prob_range", "prob_rising"]].tail(100).copy()
+            display_df["timestamp_sgt"] = display_df["timestamp_sgt"].dt.strftime("%Y-%m-%d %H:%M SGT")
+            st.dataframe(display_df, use_container_width=True, hide_index=True)

@@ -1,0 +1,66 @@
+name: Regime logger
+
+# Runs every 15 minutes, Monday-Friday only, all day (UTC). GitHub does not
+# guarantee exact-minute timing for scheduled workflows -- expect a few
+# minutes of jitter, especially during peak GitHub load. That's fine here;
+# we're tracking regime stability over hours/days, not needing second-level
+# precision.
+on:
+  schedule:
+    - cron: "*/15 * * * 1-5"
+  workflow_dispatch: {}  # lets you trigger a run manually from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  log-regime:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main (for the code)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch existing log from the data branch (if any)
+        run: |
+          git fetch origin data 2>/dev/null || echo "No data branch yet -- first run."
+          mkdir -p /tmp/existing
+          git show origin/data:logs/regime_log.csv > /tmp/existing/regime_log.csv 2>/dev/null \
+            || echo "No existing log file yet -- starting fresh."
+
+      - name: Compute regime and update log
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: |
+          python regime_logger.py --existing /tmp/existing/regime_log.csv --output /tmp/new_regime_log.csv
+
+      - name: Commit updated log to the data branch
+        run: |
+          git config user.name "regime-logger-bot"
+          git config user.email "actions@users.noreply.github.com"
+
+          # Keep the data branch minimal (log files only) and separate from
+          # main's commit history entirely, since it's generated data, not
+          # source code -- avoids bloating/polluting the app's real history.
+          if git ls-remote --exit-code --heads origin data > /dev/null 2>&1; then
+            git checkout -B data origin/data
+          else
+            git checkout --orphan data
+            git rm -rf . > /dev/null 2>&1 || true
+          fi
+
+          mkdir -p logs
+          cp /tmp/new_regime_log.csv logs/regime_log.csv
+
+          git add logs/regime_log.csv
+          git commit -m "Update regime log $(date -u +'%Y-%m-%d %H:%M UTC')" || echo "Nothing new to commit."
+          git push origin data
