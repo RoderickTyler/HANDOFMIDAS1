@@ -149,9 +149,15 @@ def find_nearest_gex_clusters(gex_by_strike, spot, window_pct=0.08, magnitude_fr
     reach regardless of size" (too lenient a filter just adds noise like
     a $1-2M strike sitting next to a $25M one).
 
+    Ranks by GROSS exposure (|CallGEX| + |PutGEX|) rather than NetGEX --
+    a strike with large, roughly-offsetting call and put GEX looks small
+    on a net basis but is still visually one of the busiest strikes on the
+    chart (tall bars both up and down), so gross is what actually matches
+    "how big does this bar look", not net.
+
     window_pct: how far from spot to look (fraction of spot price).
-    magnitude_frac: a strike must have |NetGEX| at least this fraction of
-        the largest |NetGEX| within the window (default 20%) to count as
+    magnitude_frac: a strike must have gross GEX at least this fraction of
+        the largest gross GEX within the window (default 20%) to count as
         a real concentration rather than noise.
     Returns a DataFrame sorted by distance from spot (nearest first), or
     an empty DataFrame if nothing in the window clears the bar.
@@ -164,9 +170,9 @@ def find_nearest_gex_clusters(gex_by_strike, spot, window_pct=0.08, magnitude_fr
     ].copy()
     if window.empty:
         return pd.DataFrame()
-    window["AbsNetGEX"] = window["NetGEX"].abs()
-    threshold = window["AbsNetGEX"].max() * magnitude_frac
-    candidates = window[window["AbsNetGEX"] >= threshold].copy()
+    window["GrossGEX"] = window["CallGEX"].abs() + window["PutGEX"].abs()
+    threshold = window["GrossGEX"].max() * magnitude_frac
+    candidates = window[window["GrossGEX"] >= threshold].copy()
     if candidates.empty:
         return pd.DataFrame()
     candidates["DistFromSpot"] = candidates.index - spot
@@ -686,16 +692,20 @@ with tabs[7]:
                 dist = row["DistFromSpot"]
                 side = "above spot (resistance-leaning)" if dist > 0 else "below spot (support-leaning)" if dist < 0 else "essentially AT spot (pin risk)"
                 call_gex, put_gex = row["CallGEX"], row["PutGEX"]
+                gross_gex = row["GrossGEX"]
+                net_gex = call_gex + put_gex
                 if abs(call_gex) > abs(put_gex) * 1.3:
                     lean = "call-dominant"
                 elif abs(put_gex) > abs(call_gex) * 1.3:
                     lean = "put-dominant"
+                elif gross_gex > 0 and abs(net_gex) < gross_gex * 0.3:
+                    lean = "two-sided / battleground (large call AND put both, net mostly cancels)"
                 else:
                     lean = "mixed call/put"
                 pct_away = (dist / result.spot) * 100
                 line = (
                     f"**{strike:.2f}** ({pct_away:+.2f}% from spot, {side}, {lean}) \u2014 "
-                    f"NetGEX {row['NetGEX']:,.0f}"
+                    f"Gross GEX {gross_gex:,.0f} (Net {net_gex:,.0f})"
                 )
                 if oz_for_nearest:
                     spot_equiv = strike / oz_for_nearest
