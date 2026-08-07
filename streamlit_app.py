@@ -31,6 +31,7 @@ import cot_analysis
 import reserves_utils
 import journal
 import spot_gold
+import gex_engine
 
 st.set_page_config(
     page_title="Gold Macro Dashboard",
@@ -66,6 +67,15 @@ def load_spot():
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def load_spot_history(period: str):
+    try:
+        series = fetch_data.get_xauusd_spot_history(period=period)
+        return series if not series.empty else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def load_regime(_signals: pd.DataFrame):
     return hmm_regime.analyze_regime(_signals)
 
@@ -83,6 +93,48 @@ def load_calendar(days_ahead=14):
     cal = econ_calendar.get_upcoming_calendar(days_ahead=days_ahead)
     powell = econ_calendar.get_upcoming_powell_speeches(days_ahead=days_ahead)
     return cal, powell
+
+
+GEX_CACHE_TTL = 10 * 60  # options data is more time-sensitive than macro data
+
+
+@st.cache_data(ttl=GEX_CACHE_TTL, show_spinner=False)
+def load_gex_expirations(ticker: str):
+    import yfinance as yf
+    return list(yf.Ticker(ticker).options)
+
+
+@st.cache_data(ttl=GEX_CACHE_TTL, show_spinner=False)
+def load_gex_assessment(ticker: str, expiration, min_oi, use_marketdata: bool):
+    if use_marketdata and config.MARKETDATA_API_KEY:
+        chain, spot = gex_engine.fetch_gld_chain_marketdata_app(
+            api_key=config.MARKETDATA_API_KEY,
+            underlying=ticker,
+            min_open_interest=min_oi or None,
+        )
+    else:
+        chain, spot = gex_engine.fetch_gld_chain_yfinance(
+            ticker=ticker, expiration=expiration, min_open_interest=min_oi or None
+        )
+    result = gex_engine.run_assessment(chain, spot=spot, underlying=ticker)
+    return result
+
+
+@st.cache_data(ttl=GEX_CACHE_TTL, show_spinner=False)
+def load_gex_live_refs():
+    live_gld = None
+    live_xau = None
+    try:
+        live_gld = gex_engine.fetch_live_gld_spot()
+    except Exception:
+        pass
+    try:
+        spot_result = spot_gold.fetch_xauusd_spot()
+        if spot_result is not None:
+            live_xau = spot_result["price"]
+    except Exception:
+        pass
+    return live_gld, live_xau
 
 
 def load_factor_attribution(signals, reserves_df):
@@ -155,7 +207,7 @@ if spot_result is not None:
 
 tabs = st.tabs([
     "Overview", "Regime (HMM)", "COT Positioning", "Factor Attribution",
-    "Econ Calendar", "Central Bank Reserves", "Journal",
+    "Econ Calendar", "Central Bank Reserves", "Journal", "GEX (Options)",
 ])
 
 # ---------------------------------------------------------------------------
@@ -192,9 +244,23 @@ with tabs[0]:
     col8.metric("30d Corr Gold/DXY", f"{corr_dxy:+.2f}" if corr_dxy is not None else "n/a", help="Expected negative")
 
     st.markdown("#### Price history")
-    chart_cols = [c for c in ["gold_spot", "dxy"] if c in signals.columns]
-    if chart_cols:
-        st.line_chart(signals[chart_cols].dropna(how="all"))
+    spot_history = load_spot_history(period)
+    chart_df = pd.DataFrame(index=signals.index)
+    if spot_history is not None:
+        chart_df["Gold Spot (XAUUSD)"] = spot_history.reindex(chart_df.index)
+        gold_chart_note = "Showing true spot gold (XAUUSD), not the futures contract."
+    else:
+        chart_df["Gold (GC=F futures)"] = signals["gold_spot"] if "gold_spot" in signals.columns else None
+        gold_chart_note = (
+            "Couldn't fetch true spot gold (XAUUSD=X) this run, so this is showing "
+            "GC=F futures instead \u2014 they track closely but aren't identical."
+        )
+    if "dxy" in signals.columns:
+        chart_df["DXY"] = signals["dxy"]
+    chart_df = chart_df.dropna(how="all")
+    if not chart_df.empty:
+        st.line_chart(chart_df)
+    st.caption(gold_chart_note)
 
     st.markdown("#### Divergence flags")
     st.caption("Where the textbook gold-vs-DXY / gold-vs-real-yield relationship may be breaking down.")
@@ -484,3 +550,146 @@ with tabs[6]:
 
     st.markdown("### Hit-rate scoreboard")
     st.text(journal.hit_rate_summary())
+
+# ---------------------------------------------------------------------------
+# Tab: GEX (Options) -- independent engine, own product/data source
+# ---------------------------------------------------------------------------
+
+with tabs[7]:
+    st.subheader("Dealer Gamma Exposure (GEX) \u2014 GLD options")
+    st.caption(
+        "Separate engine from the macro system above: pulls a live options chain "
+        "for ONE product (GLD by default) and estimates dealer positioning from it. "
+        "**Key assumption, unverified against real dealer books:** customers are "
+        "assumed net long calls and net long puts, dealers net short both \u2014 the "
+        "standard simplifying convention most public GEX approaches use, not a fact "
+        "about this specific chain. Treat everything below as a diagnostic overlay, "
+        "not a signal on its own."
+    )
+
+    gcol1, gcol2, gcol3 = st.columns([1, 1, 1])
+    ticker = gcol1.text_input("Ticker", value="GLD")
+    min_oi_input = gcol2.number_input("Min open interest filter", min_value=0, value=0, step=10)
+    use_md = False
+    if config.MARKETDATA_API_KEY:
+        use_md = gcol3.toggle("Use MarketData.app", value=True, help="More reliable OI/Greeks than the free yfinance fallback.")
+    else:
+        gcol3.caption("Using yfinance (free). Add MARKETDATA_API_KEY as a secret for more reliable OI/Greeks.")
+
+    expiration_choice = None
+    if not use_md:
+        try:
+            expirations = load_gex_expirations(ticker)
+        except Exception as e:
+            expirations = []
+            st.warning(f"Could not list expirations for {ticker}: {e}")
+        if expirations:
+            exp_label = st.selectbox(
+                "Expiration",
+                ["Nearest with usable open interest (auto)"] + expirations,
+            )
+            expiration_choice = None if exp_label.startswith("Nearest") else exp_label
+
+    run_gex = st.button("\U0001F504 Run / refresh GEX assessment")
+
+    gex_state_key = f"gex_result_{ticker}_{expiration_choice}_{min_oi_input}_{use_md}"
+    if run_gex or gex_state_key not in st.session_state:
+        try:
+            with st.spinner(f"Fetching {ticker} options chain and computing GEX..."):
+                st.session_state[gex_state_key] = load_gex_assessment(
+                    ticker, expiration_choice, min_oi_input, use_md
+                )
+        except Exception as e:
+            st.session_state[gex_state_key] = None
+            st.error(
+                f"GEX assessment failed: {e}\n\n"
+                "Common causes: no listed options for this ticker, no expiration with "
+                "usable open interest right now, or (for the free yfinance path) Yahoo "
+                "rate-limiting. Try a different expiration, or lower/remove the min "
+                "open interest filter."
+            )
+
+    result = st.session_state.get(gex_state_key)
+
+    if result is not None:
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Spot", f"{result.spot:.2f}")
+        m2.metric("Net GEX", f"{result.net_gex:,.0f}")
+        m3.metric("Gamma Flip", f"{result.gamma_flip:.2f}" if result.gamma_flip else "not found")
+        m4.metric("Dealer Delta", f"{result.dealer_delta:,.0f}")
+        m5.metric("Regime", result.regime.split(" (")[0])
+        st.caption(result.regime)
+
+        st.markdown("#### GEX by strike (near spot)")
+        gbs = result.gex_by_strike.copy()
+        window = gbs[(gbs.index >= result.spot * 0.85) & (gbs.index <= result.spot * 1.15)]
+        if not window.empty:
+            st.bar_chart(window[["CallGEX", "PutGEX"]])
+        else:
+            st.bar_chart(gbs[["CallGEX", "PutGEX"]])
+        st.caption("Chart zoomed to \u00b115% of spot for readability; raw walls below cover the full chain.")
+
+        st.markdown("#### Contextual levels (spot-aware support/resistance)")
+        try:
+            ctx = result.contextual_levels()
+            c1, c2 = st.columns(2)
+            with c1:
+                st.write(f"**ATM pin:** {ctx['atm_pin'][0]:.2f}  (GEX {ctx['atm_pin'][1]:,.0f})")
+                st.write(
+                    f"**Largest wall overall:** {ctx['largest_wall_overall']['strike']:.2f}  "
+                    f"(GEX {ctx['largest_wall_overall']['gex']:,.0f}, "
+                    f"{ctx['largest_wall_overall']['side']})"
+                )
+                st.write("**Resistance (above spot):**")
+                if ctx["resistance"]:
+                    st.table(pd.DataFrame(ctx["resistance"], columns=["Strike", "GEX"]))
+                else:
+                    st.caption("None found above spot in this chain.")
+            with c2:
+                st.write("**Support (below spot):**")
+                if ctx["support"]:
+                    st.table(pd.DataFrame(ctx["support"], columns=["Strike", "GEX"]))
+                else:
+                    st.caption("None found below spot in this chain.")
+        except Exception as e:
+            st.warning(f"Contextual levels unavailable: {e}")
+
+        st.markdown("#### Dealer positioning context")
+        try:
+            conc = gex_engine.compute_gex_concentration(result)
+            st.write(
+                f"**GEX concentration:** net/gross ratio {conc['ratio']:.1%} "
+                f"(gross {conc['gross_gex']:,.0f}, net {conc['net_gex']:,.0f})"
+            )
+            st.caption(conc["narrative"])
+        except Exception as e:
+            st.warning(f"GEX concentration unavailable: {e}")
+
+        try:
+            delta_ctx = gex_engine.compute_dealer_delta_context(result)
+            st.write(
+                f"**Dealer delta vs. 10-day avg volume:** {delta_ctx['ratio']:.1%} "
+                f"({delta_ctx['dealer_delta']:,.0f} vs {delta_ctx['avg_volume_10d']:,.0f})"
+            )
+            st.caption(delta_ctx["size_narrative"])
+            st.caption(delta_ctx["direction_narrative"])
+        except Exception as e:
+            st.caption(f"Dealer delta / volume comparison unavailable this run: {e}")
+
+        st.markdown("#### Live reference (independent of chain snapshot age)")
+        live_gld, live_xau = load_gex_live_refs()
+        lc1, lc2 = st.columns(2)
+        lc1.metric(f"Live {ticker}", f"{live_gld:.2f}" if live_gld is not None else "n/a")
+        lc2.metric("Live XAUUSD spot (gold-api.com)", f"{live_xau:.2f}" if live_xau is not None else "n/a")
+        st.caption(
+            "Compare against 'Spot' above \u2014 if these differ noticeably, the chain "
+            "the GEX numbers were computed from is an older snapshot than right now."
+        )
+
+        with st.expander("Raw walls (unfiltered by spot, diagnostic)"):
+            st.write("**Call walls (largest CallGEX):**")
+            st.table(pd.DataFrame(result.call_walls, columns=["Strike", "GEX"]))
+            st.write("**Put walls (largest |PutGEX|):**")
+            st.table(pd.DataFrame(result.put_walls, columns=["Strike", "GEX"]))
+    else:
+        st.info("Click 'Run / refresh GEX assessment' above to fetch a live chain and compute GEX.")

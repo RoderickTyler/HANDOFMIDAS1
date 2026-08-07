@@ -40,6 +40,12 @@ def _get_secret(name: str, default: str = "") -> str:
 
 FRED_API_KEY = _get_secret("FRED_API_KEY")
 
+# Optional: MarketData.app key for the GEX tab. Without it, the GEX engine
+# falls back to yfinance's free options chain, which its own code comments
+# flag as having unreliable open interest for GLD -- treat the yfinance
+# path as a rough/diagnostic read, MarketData.app as the more trustworthy one.
+MARKETDATA_API_KEY = _get_secret("MARKETDATA_API_KEY")
+
 # Real spot XAUUSD (for comparison against the GC=F futures price the rest
 # of this system uses) comes from gold-api.com, which needs no key at all
 # -- see spot_gold.py. No config needed here anymore.
