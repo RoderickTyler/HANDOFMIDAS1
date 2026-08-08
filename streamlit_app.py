@@ -146,6 +146,77 @@ def compute_regime_episodes(df):
     return episodes
 
 
+def compute_regime_confidence(
+    log_df, episodes, live_top_prob=None,
+    choppy_window_hours=4, choppy_flip_threshold=2, prob_threshold=0.65,
+    min_sticky_streak_hours=1.0,
+):
+    """
+    ADDITIVE helper -- does not alter any existing regime computation.
+    Combines regime PERSISTENCE (how long the current state has held, and
+    how it compares to that state's typical dwell time this week) with the
+    HMM's own instantaneous confidence (top_prob) into one tier: sticky /
+    neutral / choppy. The intent is to distinguish "this regime read is
+    backed by a stable trend" from "this is one recent flip that may not
+    hold" -- a single flip shouldn't carry the same weight as a state
+    that's persisted well past its usual duration.
+
+    - choppy: 2+ state changes within the last `choppy_window_hours` --
+      treat the current regime as noisy, not a confirming macro layer.
+    - sticky: NOT choppy, AND current streak has cleared an absolute floor
+      (min_sticky_streak_hours) AND at least one PRIOR occurrence of this
+      state exists in the week's log to judge "typical" against (a state
+      on its very first-ever appearance has nothing to compare to -- the
+      comparison would be trivially true against itself, which is exactly
+      the "one recent flip looks stable" trap this is meant to avoid),
+      AND current streak >= that state's typical weekly dwell time,
+      AND live model probability >= prob_threshold.
+    - neutral: everything else.
+
+    Returns None if there isn't enough logged history yet to judge.
+    """
+    if log_df is None or log_df.empty or episodes is None or episodes.empty:
+        return None
+
+    current_episode = episodes.iloc[-1]
+    current_state = current_episode["state"]
+    current_streak_hours = current_episode["duration_minutes"] / 60
+
+    same_state_episodes = episodes[episodes["state"] == current_state]
+    has_prior_occurrence = len(same_state_episodes) >= 2  # current + at least 1 earlier
+    typical_dwell_hours = (
+        same_state_episodes["duration_minutes"].mean() / 60
+        if not same_state_episodes.empty else None
+    )
+
+    cutoff = log_df["timestamp_utc"].max() - pd.Timedelta(hours=choppy_window_hours)
+    flips_recent = int((episodes["start"] >= cutoff).sum())
+
+    if live_top_prob is None:
+        live_top_prob = log_df.iloc[-1]["top_prob"]
+
+    is_choppy = flips_recent >= choppy_flip_threshold
+    is_sticky = (
+        not is_choppy
+        and current_streak_hours >= min_sticky_streak_hours
+        and has_prior_occurrence
+        and (typical_dwell_hours is None or current_streak_hours >= typical_dwell_hours)
+        and live_top_prob >= prob_threshold
+    )
+    tier = "choppy" if is_choppy else ("sticky" if is_sticky else "neutral")
+
+    return {
+        "tier": tier,
+        "current_state": current_state,
+        "current_streak_hours": current_streak_hours,
+        "typical_dwell_hours": typical_dwell_hours,
+        "has_prior_occurrence": has_prior_occurrence,
+        "flips_recent": flips_recent,
+        "choppy_window_hours": choppy_window_hours,
+        "live_top_prob": live_top_prob,
+    }
+
+
 @st.cache_data(ttl=GEX_CACHE_TTL, show_spinner=False)
 def load_gex_expirations(ticker: str):
     import yfinance as yf
@@ -402,6 +473,30 @@ with tabs[1]:
     else:
         if not regime_result["model_healthy"]:
             st.warning("Model health check flagged possible overfitting -- treat this read with extra skepticism.")
+
+        # --- ADDITIVE: compact regime confidence badge (sticky/neutral/choppy) ---
+        # Moved to the top of the tab for visibility. Uses the SAME logged
+        # history as the Regime History tab, but the LIVE model probability from
+        # this tab's own regime_result (more current than the last logged snapshot).
+        hist_log_df = load_regime_log()
+        if hist_log_df is not None and regime_result is not None:
+            hist_episodes = compute_regime_episodes(hist_log_df)
+            live_prob = max(regime_result["current_probs"].values())
+            confidence = compute_regime_confidence(hist_log_df, hist_episodes, live_top_prob=live_prob)
+            if confidence is not None:
+                tier_display = {
+                    "sticky": ("\U0001F7E2", "Sticky / high confidence"),
+                    "neutral": ("\U0001F7E1", "Neutral"),
+                    "choppy": ("\U0001F534", "Choppy / low confidence"),
+                }
+                emoji, label = tier_display[confidence["tier"]]
+                st.markdown(f"**Regime confidence (from {confidence['choppy_window_hours']}h/weekly history): {emoji} {label}**")
+                st.caption(
+                    f"{confidence['flips_recent']} flip(s) in the last {confidence['choppy_window_hours']}h \u2014 "
+                    f"current streak {confidence['current_streak_hours']:.1f}h \u2014 "
+                    f"full detail in the Regime History tab."
+                )
+                st.markdown("---")
 
         probs_df = pd.DataFrame(
             {"state": list(regime_result["current_probs"].keys()),
@@ -924,6 +1019,42 @@ with tabs[8]:
         episodes = compute_regime_episodes(log_df)  # duration math is tz-agnostic, uses timestamp_utc internally
         episodes["start_sgt"] = episodes["start"].dt.tz_convert("Asia/Singapore")
         episodes["end_sgt"] = episodes["end"].dt.tz_convert("Asia/Singapore")
+
+        # --- ADDITIVE: regime confidence tier (sticky/neutral/choppy) ---
+        # Purely additive on top of everything above -- doesn't change any
+        # existing metric, chart, or table in this tab.
+        confidence = compute_regime_confidence(log_df, episodes)
+        if confidence is not None:
+            tier_display = {
+                "sticky": ("\U0001F7E2", "Sticky / high confidence"),
+                "neutral": ("\U0001F7E1", "Neutral"),
+                "choppy": ("\U0001F534", "Choppy / low confidence"),
+            }
+            emoji, label = tier_display[confidence["tier"]]
+            st.markdown(f"#### {emoji} {label}")
+            dwell_str = (
+                f"{confidence['typical_dwell_hours']:.1f}h"
+                if confidence["typical_dwell_hours"] is not None and confidence["has_prior_occurrence"]
+                else "not enough history yet for this state"
+            )
+            st.caption(
+                f"{confidence['current_state']}, {confidence['current_streak_hours']:.1f}h streak "
+                f"(this state's typical dwell time this week: {dwell_str}) \u2014 "
+                f"{confidence['flips_recent']} flip(s) in the last {confidence['choppy_window_hours']}h \u2014 "
+                f"model probability {confidence['live_top_prob']*100:.0f}%"
+            )
+            if confidence["tier"] == "choppy":
+                st.warning(
+                    "Regime has flipped multiple times recently \u2014 treat the current state as noisy, "
+                    "not a confirming macro layer for a setup right now."
+                )
+            elif confidence["tier"] == "sticky":
+                st.success(
+                    "Current state has held longer than its typical duration this week, with high model "
+                    "confidence \u2014 reasonable to lean on this as a supporting macro layer."
+                )
+            else:
+                st.caption("Neither clearly stable nor clearly choppy \u2014 treat as background context, not a confirming or disqualifying signal either way.")
 
         latest = log_df.iloc[-1]
         current_episode = episodes.iloc[-1] if not episodes.empty else None
