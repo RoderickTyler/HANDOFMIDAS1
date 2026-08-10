@@ -17,6 +17,7 @@ uses gold-api.com, which needs no key at all.)
 import os
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -126,6 +127,48 @@ def load_regime_log():
         return df if not df.empty else None
     except Exception:
         return None
+
+
+def compute_feature_separation(regime_result):
+    """
+    ADDITIVE diagnostic: for each of the model's 4 inputs, how much does
+    its STANDARDIZED value differ across the fitted states? A bigger
+    spread means that feature does more of the work distinguishing states
+    from each other -- an emergent property of the fitted model, not
+    something set by hand anywhere in the code. Uses the SAME mean/std the
+    model itself was standardized with (returned by hmm_regime.analyze_regime),
+    so scores are genuinely comparable across features despite very
+    different raw units (a return % vs a yield-change vs a vol measure).
+
+    Returns a dict {feature_name: separation_score}, sorted descending, or
+    None if the model result doesn't have what's needed (e.g. too few
+    states/observations for state_characteristics to have been computed).
+    """
+    mean = regime_result.get("mean")
+    std = regime_result.get("std")
+    characteristics = regime_result.get("state_characteristics")
+    if mean is None or std is None or not characteristics:
+        return None
+
+    feature_cols = hmm_regime.FEATURE_COLS
+    mean_arr = np.asarray(mean).flatten()
+    std_arr = np.asarray(std).flatten()
+
+    scores = {}
+    for i, feat in enumerate(feature_cols):
+        if i >= len(std_arr) or std_arr[i] == 0:
+            continue
+        standardized_state_means = []
+        for row in characteristics:
+            raw_mean = row.get(f"{feat}_mean")
+            if raw_mean is not None and raw_mean == raw_mean:  # not NaN
+                standardized_state_means.append((raw_mean - mean_arr[i]) / std_arr[i])
+        if len(standardized_state_means) >= 2:
+            scores[feat] = max(standardized_state_means) - min(standardized_state_means)
+
+    if not scores:
+        return None
+    return dict(sorted(scores.items(), key=lambda kv: -kv[1]))
 
 
 def compute_regime_episodes(df):
@@ -513,6 +556,28 @@ with tabs[1]:
                  "pct_of_days": list(regime_result["state_frequency"].values())}
             ).set_index("state")
             st.bar_chart(freq_df)
+
+        with st.expander("Why this regime? (feature separation)"):
+            st.caption(
+                "For each of the model's 4 inputs: how much does its standardized "
+                "value differ across the fitted states? A bigger bar means that "
+                "feature does more of the work distinguishing states from each "
+                "other -- this falls out of the historical data, nothing here is "
+                "manually weighted."
+            )
+            separation = compute_feature_separation(regime_result)
+            if separation is None:
+                st.caption("Not available this run (need more fitted states/observations).")
+            else:
+                sep_df = pd.DataFrame(
+                    {"feature": list(separation.keys()), "separation_score": list(separation.values())}
+                ).set_index("feature")
+                st.bar_chart(sep_df)
+                top_feature = next(iter(separation))
+                st.caption(
+                    f"Highest this run: **{top_feature}** -- the feature currently doing the "
+                    f"most to distinguish Declining/Range/Rising from each other."
+                )
 
         st.markdown("**Full-history transition matrix**")
         st.dataframe(regime_result["transition_matrix"].round(3))
