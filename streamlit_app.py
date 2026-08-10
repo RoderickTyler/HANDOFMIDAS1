@@ -886,7 +886,38 @@ with tabs[7]:
             "(not just any strike within reach) \u2014 filters out small/noise levels "
             "so the list favors visually significant bars near spot, not every bar."
         )
-        nearest = find_nearest_gex_clusters(gbs, result.spot)
+
+        # Pull live reference EARLY so this section can use the actual current
+        # price for "% from spot" / above-below framing, instead of the chain
+        # snapshot's spot -- which can go stale fast if there's been a big
+        # move since the chain was fetched (options chains refresh far less
+        # often than the underlying's own live price does).
+        live_gld, live_xau = load_gex_live_refs()
+        reference_spot = result.spot
+        deviation_pct = None
+        if ticker.upper() == "GLD" and live_gld:
+            reference_spot = live_gld
+            deviation_pct = abs(live_gld - result.spot) / result.spot * 100
+        elif ticker.upper() != "GLD":
+            # For a non-GLD ticker we don't have a matching "live" quote source
+            # wired up (load_gex_live_refs() is GLD/XAUUSD-specific) -- fall
+            # back to the chain's own spot rather than mixing tickers.
+            reference_spot = result.spot
+
+        DEVIATION_WARN_THRESHOLD_PCT = 0.5
+        if deviation_pct is not None and deviation_pct >= DEVIATION_WARN_THRESHOLD_PCT:
+            st.warning(
+                f"\u26a0\ufe0f Live {ticker} ({live_gld:.2f}) has moved {deviation_pct:.2f}% from this chain "
+                f"snapshot's spot ({result.spot:.2f}) \u2014 a real move since the options data was fetched, "
+                f"not just refresh lag. The levels below are computed relative to the LIVE price so the "
+                f"'% from spot' / above-below framing stays accurate; the wall strikes themselves are "
+                f"unaffected (options strikes don't move), only which side of price they're currently on can "
+                f"shift after a big move like this."
+            )
+        elif deviation_pct is not None:
+            st.caption(f"Live {ticker} vs. chain snapshot: {deviation_pct:.2f}% apart \u2014 using live price as the reference below.")
+
+        nearest = find_nearest_gex_clusters(gbs, reference_spot)
         oz_for_nearest = None
         if ticker.upper() == "GLD":
             try:
@@ -910,7 +941,7 @@ with tabs[7]:
                     lean = "two-sided / battleground (large call AND put both, net mostly cancels)"
                 else:
                     lean = "mixed call/put"
-                pct_away = (dist / result.spot) * 100
+                pct_away = (dist / reference_spot) * 100
                 line = (
                     f"**{strike:.2f}** ({pct_away:+.2f}% from spot, {side}, {lean}) \u2014 "
                     f"Gross GEX {gross_gex:,.0f} (Net {net_gex:,.0f})"
@@ -968,7 +999,6 @@ with tabs[7]:
             st.caption(f"Dealer delta / volume comparison unavailable this run: {e}")
 
         st.markdown("#### Live reference (independent of chain snapshot age)")
-        live_gld, live_xau = load_gex_live_refs()
         lc1, lc2 = st.columns(2)
         lc1.metric(f"Live {ticker}", f"{live_gld:.2f}" if live_gld is not None else "n/a")
         lc2.metric("Live XAUUSD spot (gold-api.com)", f"{live_xau:.2f}" if live_xau is not None else "n/a")
