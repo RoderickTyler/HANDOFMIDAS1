@@ -758,6 +758,45 @@ with tabs[1]:
                                 f"at least partly a smoothing artifact, not purely economic signal."
                             )
 
+                    st.markdown("##### Direction regime: original vs. smoothed model")
+                    st.caption(
+                        "The smoothed model was fit with gold_ret (not gold_vol_5d) as its "
+                        "dominant separator, so its current-state read is arguably a more "
+                        "direction-driven regime call. Comparing it against the original here "
+                        "-- not replacing it. Neither trading mode nor anything else in this "
+                        "app uses the smoothed model's read; this is diagnostic only."
+                    )
+                    dc1, dc2 = st.columns(2)
+                    with dc1:
+                        st.markdown("**Original (volatility-dominant) model**")
+                        orig_probs = regime_result["current_probs"]
+                        orig_top_state, orig_top_prob = next(iter(orig_probs.items()))
+                        st.metric("Current state", orig_top_state, f"{orig_top_prob*100:.1f}% confidence")
+                        for state, prob in orig_probs.items():
+                            st.caption(f"{state}: {prob*100:.1f}%")
+                    with dc2:
+                        st.markdown("**Smoothed (direction-dominant) model**")
+                        smoothed_probs = smoothed_result["current_probs"]
+                        smoothed_top_state, smoothed_top_prob = next(iter(smoothed_probs.items()))
+                        st.metric("Current state", smoothed_top_state, f"{smoothed_top_prob*100:.1f}% confidence")
+                        for state, prob in smoothed_probs.items():
+                            st.caption(f"{state}: {prob*100:.1f}%")
+
+                    if orig_top_state == smoothed_top_state:
+                        st.success(
+                            f"Both models agree: **{orig_top_state}**. The volatility-driven and "
+                            f"direction-driven reads point the same way -- a more robust signal "
+                            f"than either alone."
+                        )
+                    else:
+                        st.warning(
+                            f"Models DISAGREE: original says **{orig_top_state}**, smoothed says "
+                            f"**{smoothed_top_state}**. Worth treating the original's directional "
+                            f"framing with extra caution right now -- its dominant feature "
+                            f"(gold_vol_5d) may be classifying on volatility character, not "
+                            f"direction, exactly like the Aug 13-14 case."
+                        )
+
 # ---------------------------------------------------------------------------
 # Tab: COT Positioning
 # ---------------------------------------------------------------------------
