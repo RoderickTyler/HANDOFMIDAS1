@@ -50,8 +50,8 @@ CACHE_TTL = 15 * 60  # 15 minutes -- avoid hammering free APIs on every rerun
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def load_core_data(period: str):
-    data = fetch_data.fetch_all(period=period)
+def load_core_data(period: str, quick: bool = True):
+    data = fetch_data.fetch_all(period=period, quick=quick)
     merged = analysis.merge_datasets(data["market"], data["fred"])
     if merged.empty:
         return None
@@ -432,8 +432,23 @@ st.sidebar.caption("Free, no-paid-API macro dashboard for gold")
 
 period = st.sidebar.selectbox("Lookback window", ["6mo", "1y", "2y", "5y"], index=1)
 
-if st.sidebar.button("\U0001F504 Refresh data now"):
+if "quick_load" not in st.session_state:
+    st.session_state.quick_load = True  # default: quick load, per user request
+
+if st.sidebar.button("\u26a1 Quick load (skip reserves/GPR)"):
+    st.session_state.quick_load = True
     st.cache_data.clear()
+
+if st.sidebar.button("\U0001F504 Refresh data now"):
+    st.session_state.quick_load = False
+    st.cache_data.clear()
+
+st.sidebar.caption(
+    "Quick load is the default \u2014 skips Central Bank Reserves and the "
+    "Geopolitical Risk Index for a faster load (both are the slowest, "
+    "flakiest fetches). For the full dataset including those, click "
+    "'Refresh data now' above."
+)
 
 if not config.FRED_API_KEY:
     st.sidebar.error(
@@ -461,7 +476,7 @@ st.caption(f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} \u2014 lookba
 
 try:
     with st.spinner("Fetching market data, yields, reserves, and risk index..."):
-        core = load_core_data(period)
+        core = load_core_data(period, quick=st.session_state.quick_load)
 except Exception as e:
     core = None
     st.error(

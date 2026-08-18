@@ -102,6 +102,38 @@ def get_market_data(period="1y", interval="1d"):
     return df
 
 
+def get_xauusd_spot_history(period="1y", interval="1d"):
+    """
+    TRUE spot gold (XAU/USD) daily history, via Yahoo Finance's "XAUUSD=X"
+    ticker -- this is genuinely different from get_market_data()'s
+    "gold_spot" column, which (despite the name) is actually GC=F, the
+    COMEX gold FUTURES front-month contract. Futures and spot track each
+    other closely but are not identical (contango/backwardation, roll
+    effects), so this exists purely to give an honest, correctly-labeled
+    real-spot series for display -- it does NOT feed into any of the
+    existing signals/correlations/regime model, which all deliberately
+    continue to use GC=F as before.
+
+    Returns a pandas Series of Close prices indexed by date (tz-naive,
+    normalized to match the rest of the pipeline), or an empty Series if
+    the fetch fails for any reason -- callers should treat that as "fall
+    back to futures for display" rather than a hard error.
+    """
+    try:
+        hist = yf.Ticker("XAUUSD=X").history(period=period, interval=interval)
+        if hist.empty:
+            print("[warn] No data returned for XAUUSD=X (spot gold) -- yfinance may not carry this ticker right now.")
+            return pd.Series(dtype=float, name="xauusd_spot")
+        series = hist["Close"]
+        series.index = series.index.tz_localize(None).normalize()
+        series = series.groupby(series.index).last()
+        series.name = "xauusd_spot"
+        return series
+    except Exception as e:
+        print(f"[warn] Failed to fetch XAUUSD=X (spot gold) history: {e}")
+        return pd.Series(dtype=float, name="xauusd_spot")
+
+
 # ---------------------------------------------------------------------------
 # Rates / real yields (FRED)
 # ---------------------------------------------------------------------------
@@ -374,7 +406,17 @@ def get_imf_gold_reserves_volume(countries=None):
 # Convenience: pull everything at once
 # ---------------------------------------------------------------------------
 
-def fetch_all(period="1y"):
+def fetch_all(period="1y", quick=False):
+    """
+    quick=True skips the Geopolitical Risk Index and IMF central bank
+    reserves fetches (both USD-value and physical-quantity) -- these are
+    consistently the slowest calls (GPR is an Excel file fetch from an
+    external researcher's site; IMF's SDMX API can be flaky/slow even when
+    it works) and aren't needed for most day-to-day dashboard views.
+    Returns empty DataFrames for the skipped keys, which every downstream
+    consumer already handles gracefully (the same shape as "this fetch
+    failed on a normal, non-quick run" -- an already-handled case).
+    """
     print("Fetching market data (gold, DXY, VIX)...")
     market = get_market_data(period=period)
 
@@ -382,15 +424,22 @@ def fetch_all(period="1y"):
     print(f"Fetching Treasury yield data from FRED (from {fred_start}, matching market data lookback)...")
     fred = get_fred_data(start=fred_start)
 
-    print("Fetching Geopolitical Risk Index...")
-    gpr = get_gpr_index()
+    if quick:
+        print("[quick load] Skipping Geopolitical Risk Index and IMF central bank reserves.")
+        gpr = pd.DataFrame()
+        reserves = pd.DataFrame()
+        reserves_volume = pd.DataFrame()
+        reserves_volume_unit = None
+    else:
+        print("Fetching Geopolitical Risk Index...")
+        gpr = get_gpr_index()
 
-    print("Fetching central bank gold reserves from IMF (USD value)...")
-    reserves = get_imf_gold_reserves()
+        print("Fetching central bank gold reserves from IMF (USD value)...")
+        reserves = get_imf_gold_reserves()
 
-    print("Fetching central bank gold reserves from IMF (physical quantity -- to separate real "
-          "buying/selling from pure price effect)...")
-    reserves_volume, reserves_volume_unit = get_imf_gold_reserves_volume()
+        print("Fetching central bank gold reserves from IMF (physical quantity -- to separate real "
+              "buying/selling from pure price effect)...")
+        reserves_volume, reserves_volume_unit = get_imf_gold_reserves_volume()
 
     return {
         "market": market,
