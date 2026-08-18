@@ -171,6 +171,80 @@ def compute_feature_separation(regime_result):
     return dict(sorted(scores.items(), key=lambda kv: -kv[1]))
 
 
+# ---------------------------------------------------------------------------
+# EXPERIMENTAL, ADDITIVE ONLY: two ways of digging into the gold_vol_5d
+# dominance finding, per user request. Both are self-contained -- neither
+# touches the existing regime_result, mode, or any display above them.
+# ---------------------------------------------------------------------------
+
+def compute_volatility_context(regime_result, lookback_days=252):
+    """
+    OPTION 1: instead of asking "which feature wins" (constant -- always
+    gold_vol_5d, per user observation), ask the more informative question:
+    is CURRENT gold_vol_5d elevated or calm relative to ITS OWN recent
+    history? That's the part that actually varies day to day and is
+    genuinely useful for stop-sizing.
+    """
+    feat_df = regime_result.get("feat_df")
+    if feat_df is None or feat_df.empty or "gold_vol_5d" not in feat_df.columns:
+        return None
+
+    series = feat_df["gold_vol_5d"].dropna()
+    if len(series) < 20:
+        return None
+
+    window = series.tail(lookback_days)
+    current = series.iloc[-1]
+    percentile = (window < current).sum() / len(window) * 100
+
+    lookback_for_trend = min(10, len(series) - 1)
+    prior = series.iloc[-1 - lookback_for_trend]
+    trend = "rising" if current > prior else "falling" if current < prior else "flat"
+    trend_pct = ((current - prior) / prior * 100) if prior != 0 else None
+
+    return {
+        "current": current,
+        "percentile_in_own_history": percentile,
+        "window_days": len(window),
+        "trend": trend,
+        "trend_pct": trend_pct,
+        "trend_lookback_days": lookback_for_trend,
+    }
+
+
+def build_smoothed_feat_df(signals, window=5):
+    """
+    OPTION 2: build a "fairer" feature set to test whether gold_vol_5d's
+    dominance is genuine economic signal or a smoothing artifact (a rolling
+    stat is inherently more persistent than raw daily changes, which an HMM
+    naturally favors when building sticky states, independent of which
+    feature is more economically meaningful). Applies the SAME 5-period
+    rolling treatment to the 3 raw-change features (rolling MEAN, matching
+    gold_vol_5d's own rolling-window persistence) while leaving gold_vol_5d
+    itself unchanged (it's already smoothed). Reuses hmm_regime.build_features'
+    exact raw-feature construction first, then smooths on top -- so this
+    stays consistent with the production pipeline rather than reinventing it.
+    """
+    df = signals.copy()
+    required = {"gold_spot", "dxy", "dfii10"}
+    if not required.issubset(df.columns):
+        return pd.DataFrame()
+
+    df = df.dropna(subset=["gold_spot", "dxy", "dfii10"])
+    df["gold_ret"] = df["gold_spot"].pct_change()
+    df["dxy_ret"] = df["dxy"].pct_change()
+    df["real_yield_chg"] = df["dfii10"].diff()
+    df["gold_vol_5d"] = df["gold_ret"].rolling(5).std()
+
+    smoothed = pd.DataFrame(index=df.index)
+    smoothed["gold_ret"] = df["gold_ret"].rolling(window).mean()
+    smoothed["dxy_ret"] = df["dxy_ret"].rolling(window).mean()
+    smoothed["real_yield_chg"] = df["real_yield_chg"].rolling(window).mean()
+    smoothed["gold_vol_5d"] = df["gold_vol_5d"]  # already smoothed, left as-is
+
+    return smoothed[hmm_regime.FEATURE_COLS].dropna()
+
+
 def compute_regime_episodes(df):
     """
     Collapses consecutive same-state rows into episodes (start, end,
@@ -604,6 +678,85 @@ with tabs[1]:
                 st.caption(f"COT positioning check: {mode.get('cot_note', 'n/a')}")
                 if mode.get("cot_level_interpretation"):
                     st.caption(f"COT state (3yr): {mode['cot_level_interpretation']}")
+
+        st.markdown("---")
+        st.caption(
+            "Everything below this line is EXPERIMENTAL -- exploring the "
+            "gold_vol_5d dominance finding. Nothing above this line is "
+            "affected by either of these; both are self-contained side "
+            "analyses, collapsed by default."
+        )
+
+        with st.expander("\U0001F9EA Option 1: volatility vs. its own recent history"):
+            st.caption(
+                "Since gold_vol_5d wins the feature-separation check every run, "
+                "'which feature dominates' isn't actually informative day to "
+                "day. This asks the question that DOES vary: is current "
+                "volatility elevated or calm relative to its own recent range?"
+            )
+            vol_context = compute_volatility_context(regime_result)
+            if vol_context is None:
+                st.caption("Not enough history this run to compute this.")
+            else:
+                vc1, vc2, vc3 = st.columns(3)
+                vc1.metric("Current gold_vol_5d", f"{vol_context['current']:.5f}")
+                vc2.metric(
+                    "Percentile vs. own history",
+                    f"{vol_context['percentile_in_own_history']:.0f}th",
+                    help=f"Over the last {vol_context['window_days']} trading days",
+                )
+                trend_arrow = "\u2191" if vol_context["trend"] == "rising" else "\u2193" if vol_context["trend"] == "falling" else "\u2192"
+                trend_label = f"{trend_arrow} {vol_context['trend']}"
+                if vol_context["trend_pct"] is not None:
+                    trend_label += f" ({vol_context['trend_pct']:+.1f}%)"
+                vc3.metric(f"Trend (vs {vol_context['trend_lookback_days']}d ago)", trend_label)
+                if vol_context["percentile_in_own_history"] >= 80:
+                    st.warning("Volatility is elevated relative to its own recent range -- wider stop buffers / smaller size would be consistent with this.")
+                elif vol_context["percentile_in_own_history"] <= 20:
+                    st.info("Volatility is calm relative to its own recent range.")
+
+        with st.expander("\U0001F9EA Option 2: does gold_vol_5d still dominate with fair smoothing?"):
+            st.caption(
+                "Tests whether gold_vol_5d's dominance is genuine signal, or "
+                "an artifact of comparing one smoothed statistic against three "
+                "raw daily-change features (HMMs naturally favor whichever "
+                "feature is most persistent when building sticky states). "
+                "Refits a SEPARATE model with the same 5-day rolling treatment "
+                "applied to all 4 features. Does not affect the model or "
+                "trading mode used anywhere else in this app."
+            )
+            if st.button("Run the fair-smoothing comparison"):
+                with st.spinner("Refitting with smoothed features..."):
+                    try:
+                        smoothed_feat_df = build_smoothed_feat_df(signals)
+                        smoothed_result = hmm_regime.analyze_regime(signals, precomputed_feat_df=smoothed_feat_df) if not smoothed_feat_df.empty else None
+                    except Exception as e:
+                        smoothed_result = None
+                        st.warning(f"Smoothed refit failed this run: {e}")
+
+                if smoothed_result is None:
+                    st.caption("Not enough smoothed history this run to compute this.")
+                else:
+                    smoothed_separation = compute_feature_separation(smoothed_result)
+                    if smoothed_separation is None:
+                        st.caption("Could not compute separation scores for the smoothed model.")
+                    else:
+                        sep_df = pd.DataFrame(
+                            {"feature": list(smoothed_separation.keys()), "separation_score": list(smoothed_separation.values())}
+                        ).set_index("feature")
+                        st.bar_chart(sep_df)
+                        top_feature = next(iter(smoothed_separation))
+                        if top_feature == "gold_vol_5d":
+                            st.warning(
+                                "gold_vol_5d STILL dominates even with comparable smoothing on every "
+                                "feature -- points toward genuine signal, not just a smoothing artifact."
+                            )
+                        else:
+                            st.info(
+                                f"With fair smoothing, **{top_feature}** takes over as the top "
+                                f"separator instead -- consistent with the original dominance being "
+                                f"at least partly a smoothing artifact, not purely economic signal."
+                            )
 
 # ---------------------------------------------------------------------------
 # Tab: COT Positioning
