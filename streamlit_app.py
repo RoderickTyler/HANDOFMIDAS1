@@ -35,6 +35,10 @@ import journal
 import spot_gold
 import gex_engine
 import gold_comparison
+import live_quotes
+import gex_snapshot
+import gex_alt
+import macro_confidence
 
 st.set_page_config(
     page_title="Gold Macro Dashboard",
@@ -67,6 +71,26 @@ def load_spot():
         return spot_gold.fetch_xauusd_spot()
     except Exception:
         return None
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def load_live_quotes(feed: str):
+    """
+    ADDITIVE: standalone comparison table for VIX/DXY/Gold/EURUSD/GBPUSD/
+    USDCHF/USDJPY, toggleable between yfinance and Dukascopy via the
+    sidebar. Does NOT feed into the regime model, factor attribution, the
+    main Overview metrics above it, or any other tab -- purely a separate
+    comparison view. VIX always falls back to yfinance regardless of feed
+    (confirmed unavailable via Dukascopy -- see live_quotes.py docstring).
+    """
+    rows = []
+    for sym in live_quotes.YFINANCE_TICKERS.keys():
+        try:
+            val, source_used, note = live_quotes.get_quote(sym, feed=feed)
+        except Exception as e:
+            val, source_used, note = None, "error", str(e)
+        rows.append({"Symbol": sym, "Value": val, "Source used": source_used, "Note": note})
+    return pd.DataFrame(rows)
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
@@ -373,6 +397,38 @@ def load_gex_live_refs():
     return live_gld, live_xau
 
 
+@st.cache_data(ttl=5 * 60, show_spinner=False)
+def load_remote_gex_store():
+    """ADDITIVE: last-good GEX snapshots written by the scheduled logger to the
+    `data` branch (empty dict if none yet / unreachable)."""
+    return gex_snapshot.fetch_remote()
+
+
+@st.cache_data(ttl=GEX_CACHE_TTL, show_spinner=False)
+def load_cboe_chain(symbol: str):
+    return gex_alt.fetch_cboe_chain(symbol, timeout=12)
+
+
+@st.cache_data(ttl=GEX_CACHE_TTL, show_spinner=False)
+def load_gvz():
+    return gex_alt.fetch_gvz()
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def load_risk_free():
+    return gex_alt.fetch_risk_free()
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def load_smoothed_regime(_signals: pd.DataFrame):
+    """ADDITIVE: the same fair-smoothing refit the Regime tab's Option 2 runs
+    on a button, cached so the Macro Confidence tab can reuse it."""
+    feat = build_smoothed_feat_df(_signals)
+    if feat.empty:
+        return None
+    return hmm_regime.analyze_regime(_signals, precomputed_feat_df=feat)
+
+
 def find_nearest_gex_clusters(gex_by_strike, spot, window_pct=0.08, magnitude_frac=0.20, top_n=6):
     """
     Finds strikes CLOSE to spot that ALSO stand out visually (a real
@@ -467,6 +523,18 @@ st.sidebar.caption(
     "All free, no key needed except FRED."
 )
 
+st.sidebar.markdown("---")
+live_quotes_feed_choice = st.sidebar.radio(
+    "Live Quotes feed (Overview tab)",
+    ["yfinance (default)", "Dukascopy"],
+    index=0,
+    help="Toggles the source for the separate 'Live Quotes Comparison' table on the "
+         "Overview tab only. Does NOT affect the main Gold/DXY/VIX metrics above it, "
+         "the regime model, or any other tab. VIX always falls back to yfinance -- "
+         "confirmed unavailable via Dukascopy.",
+)
+live_quotes_feed = "dukascopy" if live_quotes_feed_choice == "Dukascopy" else "yfinance"
+
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
@@ -498,11 +566,17 @@ spot_result = load_spot()
 if spot_result is not None:
     summary["xauusd_spot"] = spot_result["price"]
 
-tabs = st.tabs([
-    "Overview", "Regime (HMM)", "COT Positioning", "Factor Attribution",
+_all_tabs = st.tabs([
+    "Overview", "Regime (HMM)", "Macro Confidence", "COT Positioning", "Factor Attribution",
     "Econ Calendar", "Central Bank Reserves", "Journal", "GEX (Options)",
-    "Regime History",
+    "GEX (Alternative)", "Regime History",
 ])
+# ADDITIVE: two new tabs were inserted into the display order. `tabs[0..8]`
+# below keep their ORIGINAL meaning (so no existing `with tabs[n]:` block
+# had to change); the new tabs are addressed by name.
+tabs = [_all_tabs[i] for i in (0, 1, 3, 4, 5, 6, 7, 8, 10)]
+macro_conf_tab = _all_tabs[2]
+gex_alt_tab = _all_tabs[9]
 
 # ---------------------------------------------------------------------------
 # Tab: Overview
@@ -526,6 +600,21 @@ with tabs[0]:
     )
     vix_val = summary.get("vix")
     col4.metric("VIX", f"{vix_val:,.2f}" if vix_val is not None else "n/a")
+
+    st.markdown(f"#### Live Quotes Comparison (feed: {live_quotes_feed_choice})")
+    st.caption(
+        "Standalone comparison view, toggled from the sidebar -- does NOT feed into the "
+        "regime model, factor attribution, or the Gold/DXY/VIX metrics above. VIX always "
+        "falls back to yfinance (confirmed unavailable via Dukascopy). DXY via Dukascopy "
+        "is their own dollar-index construction, not verified identical to ICE DXY."
+    )
+    try:
+        live_quotes_df = load_live_quotes(live_quotes_feed)
+        display_df = live_quotes_df.copy()
+        display_df["Value"] = display_df["Value"].apply(lambda v: f"{v:,.4f}" if v is not None else "n/a")
+        st.table(display_df.set_index("Symbol"))
+    except Exception as e:
+        st.warning(f"Live Quotes Comparison unavailable this run: {e}")
 
     col5, col6, col7, col8 = st.columns(4)
     dgs10 = summary.get("dgs10")
@@ -1051,23 +1140,67 @@ with tabs[7]:
     run_gex = st.button("\U0001F504 Run / refresh GEX assessment")
 
     gex_state_key = f"gex_result_{ticker}_{expiration_choice}_{min_oi_input}_{use_md}"
+    gex_note_key = gex_state_key + "_note"
     if run_gex or gex_state_key not in st.session_state:
+        st.session_state[gex_note_key] = None
+        live_result, live_source = None, None
+        errors_seen = []
         try:
             with st.spinner(f"Fetching {ticker} options chain and computing GEX..."):
-                st.session_state[gex_state_key] = load_gex_assessment(
-                    ticker, expiration_choice, min_oi_input, use_md
-                )
+                live_result = load_gex_assessment(ticker, expiration_choice, min_oi_input, use_md)
+            live_source = "MarketData.app" if use_md else "yfinance"
         except Exception as e:
-            st.session_state[gex_state_key] = None
-            st.error(
-                f"GEX assessment failed: {e}\n\n"
-                "Common causes: no listed options for this ticker, no expiration with "
-                "usable open interest right now, or (for the free yfinance path) Yahoo "
-                "rate-limiting. Try a different expiration, or lower/remove the min "
-                "open interest filter."
+            errors_seen.append(f"{'MarketData.app' if use_md else 'yfinance'}: {e}")
+            # ADDITIVE fallback 1: MarketData.app failed (rate limit etc.) -> try free yfinance
+            if use_md:
+                try:
+                    with st.spinner("MarketData.app failed -- trying yfinance instead..."):
+                        live_result = load_gex_assessment(ticker, expiration_choice, min_oi_input, False)
+                    live_source = "yfinance (MarketData.app failed)"
+                    st.session_state[gex_note_key] = (
+                        "warning",
+                        f"MarketData.app failed ({errors_seen[0]}). Showing a LIVE yfinance pull instead.",
+                    )
+                except Exception as e2:
+                    errors_seen.append(f"yfinance: {e2}")
+
+        if live_result is not None:
+            st.session_state[gex_state_key] = live_result
+            # ADDITIVE: remember this as the last good pull (never raises)
+            gex_snapshot.save_payload(
+                f"{ticker.upper()}|main",
+                gex_snapshot.payload_from_result(live_result, expiration_choice, live_source),
             )
+        else:
+            st.session_state[gex_state_key] = None
+            # ADDITIVE fallback 2: last successful pull (local file or data branch)
+            snap, origin = gex_snapshot.load_best_payload(f"{ticker.upper()}|main", load_remote_gex_store())
+            if snap is not None:
+                try:
+                    st.session_state[gex_state_key] = gex_snapshot.result_from_payload(snap)
+                    when, age = gex_snapshot.describe_age(snap.get("saved_utc"))
+                    st.session_state[gex_note_key] = (
+                        "error",
+                        f"LIVE FETCH FAILED -- showing the LAST SUCCESSFUL pull instead: "
+                        f"**{when}** ({age}; source {snap.get('source', 'unknown')}; stored {origin}). "
+                        f"Nothing below is live. Failure detail: {' | '.join(errors_seen)}",
+                    )
+                except Exception as e3:
+                    errors_seen.append(f"snapshot unreadable: {e3}")
+            if st.session_state[gex_state_key] is None:
+                st.error(
+                    f"GEX assessment failed: {' | '.join(errors_seen)}\n\n"
+                    "Common causes: no listed options for this ticker, no expiration with "
+                    "usable open interest right now, or (for the free yfinance path) Yahoo "
+                    "rate-limiting. Try a different expiration, or lower/remove the min "
+                    "open interest filter. No saved snapshot exists yet for this ticker. "
+                    "The GEX (Alternative) tab uses a different data source and may still work."
+                )
 
     result = st.session_state.get(gex_state_key)
+    _gex_note = st.session_state.get(gex_note_key)
+    if _gex_note and result is not None:
+        (st.error if _gex_note[0] == "error" else st.warning)(_gex_note[1])
 
     if result is not None:
         m1, m2, m3, m4, m5 = st.columns(5)
@@ -1410,3 +1543,364 @@ with tabs[8]:
             display_df = log_df[["timestamp_sgt", "top_state", "top_prob", "prob_declining", "prob_range", "prob_rising"]].tail(100).copy()
             display_df["timestamp_sgt"] = display_df["timestamp_sgt"].dt.strftime("%Y-%m-%d %H:%M SGT")
             st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+
+# ===========================================================================
+# ADDITIVE: Macro Confidence tab
+# ===========================================================================
+
+with macro_conf_tab:
+    st.subheader("Macro Confidence")
+    st.caption(
+        "One place to see how much corroboration sits behind today's trading mode. It pulls together "
+        "checks the app already runs elsewhere (HMM conviction, model health, recent-vs-full persistence, "
+        "the logged sticky/choppy tier, the smoothed direction-regime cross-check, COT crowding, "
+        "volatility percentile). **It is a rule-based checklist, not a calibrated probability, and the "
+        "layers are not independent** (several come from the same HMM), so '5 of 6 agree' is weaker "
+        "evidence than it sounds. It does not change the mode or size. GEX is deliberately excluded — "
+        "that is a separate dealer-positioning overlay, not part of the macro regime."
+    )
+
+    try:
+        mc_regime = load_regime(signals)
+    except Exception as e:
+        mc_regime = None
+        st.warning(f"Regime model failed this run (non-fatal): {e}")
+
+    try:
+        mc_cot = load_cot()
+    except Exception:
+        mc_cot = None
+
+    if mc_regime is None:
+        st.info("Not enough data yet to fit the regime model.")
+    else:
+        try:
+            mc_mode = trading_mode.determine_mode(mc_regime, cot_result=mc_cot)
+        except Exception as e:
+            mc_mode = None
+            st.warning(f"Trading mode failed this run: {e}")
+
+        if mc_mode:
+            # Logged persistence tier (same helpers the Regime tab badge uses)
+            mc_persist = None
+            try:
+                _log = load_regime_log()
+                if _log is not None:
+                    _eps = compute_regime_episodes(_log)
+                    mc_persist = compute_regime_confidence(
+                        _log, _eps, live_top_prob=max(mc_regime["current_probs"].values())
+                    )
+            except Exception:
+                mc_persist = None
+
+            # Smoothed (direction-dominant) model: opt-in, because it's an extra HMM fit
+            st.markdown("##### Direction-regime cross-check")
+            if st.button("Run / refresh the smoothed-model cross-check", key="mc_run_smoothed"):
+                st.session_state["mc_smoothed_requested"] = True
+            mc_smoothed = None
+            if st.session_state.get("mc_smoothed_requested"):
+                with st.spinner("Refitting with fair smoothing (cached for 15 min)..."):
+                    try:
+                        mc_smoothed = load_smoothed_regime(signals)
+                        if mc_smoothed is None:
+                            st.caption("Not enough smoothed history this run.")
+                    except Exception as e:
+                        st.warning(f"Smoothed refit failed this run: {e}")
+            else:
+                st.caption(
+                    "Not run yet — it refits a second HMM, so it is opt-in. Until you run it, that layer "
+                    "shows as n/a and is excluded from the tally."
+                )
+
+            try:
+                mc_vol = compute_volatility_context(mc_regime)
+            except Exception:
+                mc_vol = None
+
+            layers = macro_confidence.build_layers(mc_regime, mc_mode, mc_persist, mc_smoothed, mc_vol)
+            tally = macro_confidence.summarize(layers)
+
+            st.markdown("---")
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Regime", mc_mode["top_state"], f"{mc_mode['top_prob']*100:.0f}% (HMM)")
+            k2.metric("Mode", mc_mode["strategy_name"].split(" (")[0].title())
+            k3.metric("Suggested size", mc_mode["size"].split(" -- ")[0])
+            k4.metric("Layer agreement", tally["label"],
+                      f"{tally['supports']}/{tally['evaluable']} support · {tally['conflicts']} conflict")
+            st.info(f"**Overall assessment:** {mc_mode['overall_assessment']}")
+
+            st.markdown("##### Checklist")
+            chk = pd.DataFrame([
+                {"": macro_confidence.ICON[l["status"]], "Layer": l["layer"],
+                 "Status": l["status"], "Detail": l["detail"]} for l in layers
+            ])
+            st.dataframe(chk, hide_index=True, use_container_width=True)
+            st.caption(
+                f"{tally['supports']} support · {tally['caution']} caution · {tally['conflicts']} conflict "
+                f"· {tally['not_evaluable']} not evaluable / neutral (excluded). "
+                "Label rule: Aligned = no caution or conflict; Conflicted = 2+ conflicts or ≥40% of evaluable "
+                "layers; otherwise Mixed. Those cut-offs are a convention, not statistically derived."
+            )
+
+            if mc_smoothed is not None:
+                st.markdown("##### Original vs smoothed model")
+                oc, sc = st.columns(2)
+                for col, title, res in ((oc, "Original (volatility-dominant)", mc_regime),
+                                        (sc, "Smoothed (direction-dominant)", mc_smoothed)):
+                    with col:
+                        st.markdown(f"**{title}**")
+                        pr = res["current_probs"]
+                        top = max(pr, key=pr.get)
+                        st.metric("Current state", top, f"{pr[top]*100:.1f}%")
+                        st.bar_chart(pd.DataFrame({"probability": [v * 100 for v in pr.values()]}, index=list(pr.keys())))
+
+            if mc_cot is not None and mc_mode.get("cot_surprise_note"):
+                st.caption(mc_mode["cot_surprise_note"])
+            if mc_persist is not None:
+                st.caption("Persistence detail and the flip timeline live in the Regime History tab.")
+
+
+# ===========================================================================
+# ADDITIVE: GEX (Alternative) tab -- CBOE + GVZ, no MarketData.app
+# ===========================================================================
+
+def _fmt_level(x):
+    return "not found" if x is None else f"{x:,.2f}"
+
+
+def _render_gex_alt_view(view, spot, gvz, sym, contracts=None):
+    """Renders one DTE selection. `view` is the dict from gex_alt.compute_view
+    (live) or its stored/JSON form (snapshot fallback); `contracts` is the
+    contract-level frame, only available live."""
+    gx = view["gex"] if isinstance(view["gex"], pd.DataFrame) else gex_snapshot.df_from_json(view["gex"])
+    t_years = view["t_years"]
+
+    # --- Expected range -----------------------------------------------------
+    st.markdown("#### Expected range for this DTE")
+    st.caption(
+        "1σ move = Spot × vol × √T (T in years to the selected expiry, or to the cumulative DTE). "
+        "GVZ is CBOE's 30-day constant-maturity implied vol on GLD options, so it is a *30-day* number applied to "
+        "a shorter horizon; the ATM-IV rows are term-specific. Implied vol usually runs above realised vol, so "
+        "these ranges tend to be wider than what actually happens. 1σ ≈ 68% only if returns were normal — "
+        "gold's tails are fatter than that."
+    )
+    rt = gex_alt.range_table(spot, t_years, gvz, view.get("atm_iv_cboe"), view.get("atm_iv_own"))
+    st.dataframe(rt.round(2), hide_index=True, use_container_width=True)
+    if gvz is not None and sym == "GLD":
+        try:
+            oz = gold_comparison.get_oz_per_share()
+            m = gex_alt.expected_move(spot, gvz / 100.0, t_years)
+            st.caption(
+                f"GVZ 1σ band in spot-gold terms (÷ oz/share {oz:.6f}): "
+                f"≈ {(spot - m) / oz:,.0f} – {(spot + m) / oz:,.0f} XAUUSD. "
+                f"Proxy conversion — see the original GEX tab for the caveats."
+            )
+        except Exception:
+            pass
+
+    # --- Side-by-side GEX ---------------------------------------------------
+    st.markdown("#### Dealer gamma: CBOE Greeks vs self-calculated Greeks")
+    st.caption(
+        "Same open interest and the same sign convention (calls +, puts −; dealers assumed short both — an "
+        "assumption, not observed dealer books). Only the Greeks differ. CBOE publishes no gamma flip, so "
+        "BOTH flips below are model-based (our Black-Scholes, fed with our IV vs CBOE's IV)."
+    )
+    lo, hi = spot * 0.92, spot * 1.08
+    cc, oc = st.columns(2)
+    with cc:
+        st.markdown("**CBOE Greeks**")
+        st.metric("Net GEX", f"{view['net_gex_cboe']:,.0f}")
+        st.metric("Gamma flip (our model, CBOE IV)", _fmt_level(view["flip_cboe_iv"]))
+        st.metric("Dealer delta (shares)", f"{view['dealer_delta_cboe']:,.0f}")
+        lv = view["levels_cboe"]
+        st.write(f"Call wall: **{_fmt_level(lv['call_wall'])}**  ·  Put wall: **{_fmt_level(lv['put_wall'])}**  ·  ATM pin: **{_fmt_level(lv['atm_pin'])}**")
+        st.write("Resistance (above spot): " + (", ".join(f"{k:,.2f}" for k, _ in lv["resistance"]) or "none"))
+        st.write("Support (below spot): " + (", ".join(f"{k:,.2f}" for k, _ in lv["support"]) or "none"))
+    with oc:
+        st.markdown("**Self-calculated Greeks**")
+        st.metric("Net GEX", f"{view['net_gex_own']:,.0f}")
+        st.metric("Gamma flip (our model, our IV)", _fmt_level(view["flip_own_iv"]))
+        st.metric("Dealer delta (shares)", f"{view['dealer_delta_own']:,.0f}")
+        lv = view["levels_own"]
+        st.write(f"Call wall: **{_fmt_level(lv['call_wall'])}**  ·  Put wall: **{_fmt_level(lv['put_wall'])}**  ·  ATM pin: **{_fmt_level(lv['atm_pin'])}**")
+        st.write("Resistance (above spot): " + (", ".join(f"{k:,.2f}" for k, _ in lv["resistance"]) or "none"))
+        st.write("Support (below spot): " + (", ".join(f"{k:,.2f}" for k, _ in lv["support"]) or "none"))
+
+    base = view["net_gex_cboe"]
+    if base:
+        diff_pct = (view["net_gex_own"] - base) / abs(base) * 100
+        agree_sign = (view["net_gex_own"] >= 0) == (view["net_gex_cboe"] >= 0)
+        msg = f"Net GEX differs by {diff_pct:+.1f}% (own vs CBOE); sign {'agrees' if agree_sign else '**DISAGREES** — treat the regime label as unreliable'}."
+        (st.caption if agree_sign else st.warning)(msg)
+    f1, f2 = view["flip_cboe_iv"], view["flip_own_iv"]
+    if (f1 is None) != (f2 is None):
+        st.warning("Gamma flip exists under one IV input but not the other — the flip is fragile here; don't lean on it.")
+    elif f1 is not None and f2 is not None and abs(f1 - f2) / spot > 0.005:
+        st.caption(f"The two flips are {abs(f1 - f2):.2f} apart ({abs(f1 - f2) / spot * 100:.2f}% of spot) — flip level is sensitive to the IV input.")
+
+    win = gx[(gx.index >= lo) & (gx.index <= hi)]
+    if not win.empty:
+        st.markdown("**Net GEX by strike (±8% of spot)**")
+        st.bar_chart(win[["NetGEX_cboe", "NetGEX_own"]].rename(
+            columns={"NetGEX_cboe": "CBOE Greeks", "NetGEX_own": "Self-calculated"}))
+        with st.expander("Call / put split by strike"):
+            st.dataframe(win[["CallGEX_cboe", "PutGEX_cboe", "CallGEX_own", "PutGEX_own", "CallOI", "PutOI"]].round(0),
+                         use_container_width=True)
+
+    # --- Deviation ----------------------------------------------------------
+    st.markdown("#### How far apart are the Greeks?")
+    dv = view.get("deviation") or {}
+    if not dv.get("n"):
+        st.caption("No contracts with both Greek sets in this selection.")
+    else:
+        def _nf(x, fmt):
+            return "n/a" if x is None or x != x else format(x, fmt)
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Median |ΔIV|", _nf(dv.get("median_abs_dIV_pts"), ".2f") + " vol pts")
+        d2.metric("Median |ΔDelta|", _nf(dv.get("median_abs_dDelta"), ".4f"))
+        d3.metric("Median |ΔGamma|", _nf(dv.get("median_abs_dGamma_pct"), ".1f") + "%")
+        d4.metric("OI-wtd Gamma own/CBOE", _nf(dv.get("oi_wtd_gamma_ratio_own_over_cboe"), ".3f"))
+        st.caption(
+            f"{dv['n']} contracts with open interest. A gamma ratio far from 1.000 means one side is "
+            f"systematically bigger, which scales every GEX number. Differences come from: IV (we back ours out "
+            f"of the bid/ask mid), time-to-expiry convention, the rate used, and CBOE possibly using an American-"
+            f"exercise model while ours is European Black-Scholes."
+        )
+
+    if contracts is not None and not contracts.empty:
+        st.markdown("**Contract detail — both IVs and both Greek sets (top 40 by open interest)**")
+        cols = ["Expiration", "Strike", "OptionType", "OpenInterest", "Bid", "Ask", "IV_cboe", "IV_own",
+                "dIV", "IV_used_source", "Delta_cboe", "Delta_own", "dDelta", "Gamma_cboe", "Gamma_own", "dGamma_pct"]
+        cd = contracts.sort_values("OpenInterest", ascending=False).head(40)[cols].copy()
+        cd = cd.rename(columns={"dIV": "ΔIV (pts)", "dDelta": "ΔDelta", "dGamma_pct": "ΔGamma %",
+                                "IV_used_source": "Own Greeks used IV"})
+        st.dataframe(cd.round(4), hide_index=True, use_container_width=True)
+    elif contracts is None:
+        st.caption("Contract-level table needs live data; not stored in the snapshot.")
+
+
+with gex_alt_tab:
+    st.subheader("GEX (Alternative) — CBOE delayed quotes + GVZ")
+    st.caption(
+        "Independent of the GEX (Options) tab and of MarketData.app: option chain, open interest and Greeks come "
+        "from CBOE's free delayed-quote feed; expected range from GVZ. CBOE's own Greeks and our Black-Scholes "
+        "Greeks are shown separately so you can see where they deviate. **Data limits:** quotes are delayed "
+        "(~15 min) and open interest is the *previous day's* figure, so intraday GEX is an estimate. "
+        "**Verification status:** the CBOE feed layout is coded from knowledge of that public endpoint and has "
+        "not yet been confirmed against a live response — if the fetch below fails, the error text shows exactly "
+        "what came back."
+    )
+
+    ac1, ac2, ac3 = st.columns([1, 2, 1])
+    alt_sym = ac1.text_input("Underlying", value="GLD", key="galt_sym").upper().strip() or "GLD"
+    alt_basis_label = ac2.radio(
+        "Self-calculated Greeks use",
+        ["Own IV (backed out of bid/ask mid)", "CBOE's IV (isolates formula / time / rate differences)"],
+        key="galt_basis", horizontal=False,
+    )
+    alt_basis = "mid" if alt_basis_label.startswith("Own") else "cboe"
+    ac3.write("")
+    if ac3.button("\U0001F504 Refresh CBOE data", key="galt_refresh"):
+        load_cboe_chain.clear()
+        load_gvz.clear()
+        st.session_state.pop("galt_fail_until", None)
+
+    # --- live fetch (failures are remembered briefly so widget clicks don't each wait on a dead host)
+    alt_live, alt_err = None, None
+    _now = datetime.now().timestamp()
+    if _now < st.session_state.get("galt_fail_until", 0):
+        alt_err = st.session_state.get("galt_fail_msg", "recent fetch failed")
+    else:
+        try:
+            with st.spinner("Fetching CBOE delayed option chain..."):
+                _raw, _meta = load_cboe_chain(alt_sym)
+            alt_live = (_raw, _meta)
+            st.session_state.pop("galt_fail_until", None)
+        except Exception as e:
+            alt_err = str(e)
+            st.session_state["galt_fail_until"] = _now + 120
+            st.session_state["galt_fail_msg"] = alt_err
+
+    if alt_live is not None:
+        raw_df, meta = alt_live
+        spot_alt = meta["spot"]
+        rf, rf_note = load_risk_free()
+        gvz_val = load_gvz()
+        chain_alt = gex_alt.add_time_to_expiry(raw_df, meta.get("asof_utc"))
+        enr = gex_alt.enrich_chain(chain_alt, spot_alt, rf, alt_basis)
+        exp_tbl = gex_alt.expiry_table(enr)
+
+        asof_iso = meta["asof_utc"].isoformat() if meta.get("asof_utc") else None
+        when, age = gex_snapshot.describe_age(asof_iso) if asof_iso else ("unknown", "unknown age")
+        st.success(f"Live CBOE data — stamped **{when}** ({age}); source: {meta.get('url')}")
+        if not meta.get("has_cboe_greeks"):
+            st.warning("This CBOE response contained no Greeks — the 'CBOE Greeks' side will be empty/zero.")
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(f"{alt_sym} (CBOE)", f"{spot_alt:,.2f}")
+        m2.metric("GVZ", f"{gvz_val:.2f}" if gvz_val is not None else "n/a")
+        m3.metric("CBOE iv30 (raw, as published)", f"{float(meta['iv30']):.4g}" if meta.get("iv30") not in (None, "") else "n/a")
+        m4.metric("Risk-free used", f"{rf*100:.2f}%", help=rf_note)
+
+        if exp_tbl.empty:
+            st.warning("No unexpired expirations in the CBOE response.")
+        else:
+            st.markdown("#### Choose the DTE")
+            dte_mode = st.radio(
+                "Selection", ["Single expiry", "Cumulative (all expiries up to N days)"],
+                key="galt_mode", horizontal=True,
+            )
+            alt_view = None
+            if dte_mode == "Single expiry":
+                labels = [f"{r_.Expiration}  —  {r_.DTE_label}  —  OI {r_.TotalOI:,.0f}" for r_ in exp_tbl.itertuples()]
+                pick = st.selectbox("Expiry", labels, index=0, key="galt_exp")
+                chosen = exp_tbl.iloc[labels.index(pick)]
+                alt_view = gex_alt.compute_view(enr, spot_alt, rf, "single", expiry=chosen["Expiration"])
+            else:
+                max_avail = float(exp_tbl["DTE"].max())
+                opts = [d_ for d_ in (1, 2, 3, 5, 7, 14, 21, 30, 45, 60, 90) if d_ <= max_avail + 1] or [int(max(max_avail, 1))]
+                n_days = st.select_slider("Up to N days to expiry", options=opts, value=7 if 7 in opts else opts[-1], key="galt_cum")
+                alt_view = gex_alt.compute_view(enr, spot_alt, rf, "cumulative", max_dte=n_days)
+
+            with st.expander("All expiries (DTE, open interest)"):
+                st.dataframe(exp_tbl[["Expiration", "DTE_label", "TotalOI", "Contracts"]].rename(
+                    columns={"DTE_label": "DTE"}), hide_index=True, use_container_width=True)
+
+            # remember this pull as the last good one (once per CBOE timestamp / basis)
+            _save_tag = f"{alt_sym}|{asof_iso}|{alt_basis}"
+            if st.session_state.get("galt_saved_for") != _save_tag:
+                try:
+                    _payload = gex_alt.build_snapshot_payload(alt_sym, spot_alt, meta, enr, rf, rf_note, gvz_val, alt_basis)
+                    if gex_snapshot.save_payload(f"{alt_sym}|alt", _payload):
+                        st.session_state["galt_saved_for"] = _save_tag
+                except Exception as e:
+                    st.caption(f"(Could not store a last-good snapshot this run: {e})")
+
+            if alt_view is None:
+                st.warning("No contracts with open interest in that selection.")
+            else:
+                st.caption(f"Selection: **{alt_view['label']}** — {alt_view['n_contracts']} contracts, open interest {alt_view['total_oi']:,.0f}.")
+                _render_gex_alt_view(alt_view, spot_alt, gvz_val, alt_sym, contracts=alt_view["selection_df"])
+
+    else:
+        # --- fallback: last successful CBOE pull
+        snap, origin = gex_snapshot.load_best_payload(f"{alt_sym}|alt", load_remote_gex_store())
+        st.error(f"Live CBOE fetch failed: {alt_err}")
+        if snap is None or not snap.get("views"):
+            st.info(
+                "No saved last-good snapshot yet for this underlying. Once one live pull succeeds (or the "
+                "scheduled logger has run), it will appear here automatically."
+            )
+        else:
+            when, age = gex_snapshot.describe_age(snap.get("saved_utc"))
+            cb_when, _ = gex_snapshot.describe_age(snap.get("asof_cboe_utc")) if snap.get("asof_cboe_utc") else ("unknown", "")
+            st.warning(
+                f"Showing the LAST SUCCESSFUL pull, saved **{when}** ({age}); CBOE data stamp {cb_when}; "
+                f"stored {origin}. Nothing below is live. Spot in this snapshot: {snap['spot']:,.2f}."
+            )
+            vkeys = list(snap["views"].keys())
+            vlabels = [snap["views"][k]["label"] for k in vkeys]
+            vpick = st.selectbox("Stored view", vlabels, index=0, key="galt_snap_view")
+            sv = snap["views"][vkeys[vlabels.index(vpick)]]
+            _render_gex_alt_view(sv, snap["spot"], snap.get("gvz"), alt_sym, contracts=None)
