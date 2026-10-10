@@ -57,6 +57,7 @@ _HEADERS = {"User-Agent": "Mozilla/5.0 (HandOfMidas GEX-alt)", "Accept": "applic
 _OCC_RE = re.compile(r"^(?P<root>.+?)(?P<yy>\d{2})(?P<mm>\d{2})(?P<dd>\d{2})(?P<cp>[CP])(?P<k>\d{8})$")
 
 MIN_T_YEARS = 1.0 / (365.0 * 24.0)  # floor at ~1 hour so 0DTE doesn't blow up
+HYBRID_MAX_SPREAD_PCT = 10.0       # "hybrid" mode trusts the mid-derived IV only when (ask-bid)/mid <= this
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +262,7 @@ def enrich_chain(df: pd.DataFrame, spot: float, r: float, own_iv_basis: str = "m
     own_iv_basis:
         "mid"   -> Greeks use IV_own where available, else CBOE IV (flagged per row)
         "cboe"  -> Greeks use CBOE's IV (isolates formula / time / rate differences)
+        "hybrid"-> IV_own only when the bid/ask spread is <= HYBRID_MAX_SPREAD_PCT of mid, else CBOE IV
     """
     out = df.copy()
     cp = np.where(out["OptionType"] == "call", 1.0, -1.0)
@@ -273,9 +275,17 @@ def enrich_chain(df: pd.DataFrame, spot: float, r: float, own_iv_basis: str = "m
     out["IV_own"] = implied_vol(mid, spot, K, T, r, cp)
 
     iv_c = out["IV_cboe"].to_numpy(dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        spread_pct = np.where(np.isfinite(mid) & (mid > 0), (ask - bid) / mid * 100.0, np.nan)
+    out["Spread %"] = spread_pct
     if own_iv_basis == "cboe":
         iv_used = iv_c.copy()
         src = np.where(np.isfinite(iv_c), "cboe", "none")
+    elif own_iv_basis == "hybrid":
+        # own IV only where the quote is tight enough to trust the mid; else CBOE's IV
+        tight = np.isfinite(out["IV_own"].to_numpy()) & np.isfinite(spread_pct) & (spread_pct <= HYBRID_MAX_SPREAD_PCT)
+        iv_used = np.where(tight, out["IV_own"].to_numpy(), iv_c)
+        src = np.where(tight, "own(mid)", np.where(np.isfinite(iv_c), "cboe(wide/none spread)", "none"))
     else:
         iv_used = np.where(np.isfinite(out["IV_own"]), out["IV_own"], iv_c)
         src = np.where(np.isfinite(out["IV_own"]), "own(mid)", np.where(np.isfinite(iv_c), "cboe(fallback)", "none"))
@@ -454,21 +464,262 @@ def atm_iv(sel: pd.DataFrame, spot: float, col: str) -> Optional[float]:
     return float(v.mean()) if len(v) else None
 
 
+def atm_straddle_move(sel: pd.DataFrame, spot: float) -> Optional[dict]:
+    """Price-implied 1-sigma move from the ATM straddle: for an at-the-money option,
+    call + put premium ~= 0.798 x sigma x sqrt(T) x S, so 1sigma ~= straddle / 0.798.
+    Needs no vol or time-to-expiry convention at all -- it is read straight off traded
+    prices -- which makes it a useful cross-check on the IV-based rows."""
+    d = sel[sel["Mid"].notna() & (sel["Mid"] > 0)]
+    if d.empty:
+        return None
+    strikes = np.sort(d["Strike"].unique())
+    k = float(strikes[np.argmin(np.abs(strikes - spot))])
+    c = d[(d["Strike"] == k) & (d["OptionType"] == "call")]["Mid"]
+    p = d[(d["Strike"] == k) & (d["OptionType"] == "put")]["Mid"]
+    if c.empty or p.empty:
+        return None
+    straddle = float(c.iloc[0] + p.iloc[0])
+    return {"strike": k, "straddle": straddle, "one_sigma": straddle / 0.7979}
+
+
 def range_table(spot: float, t_years: float, gvz: Optional[float], atm_cboe: Optional[float],
-                atm_own: Optional[float]) -> pd.DataFrame:
+                atm_own: Optional[float], straddle_move: Optional[float] = None) -> pd.DataFrame:
     rows = []
+    empty = {"Vol %": np.nan, "1σ move": np.nan, "1σ low": np.nan, "1σ high": np.nan,
+             "2σ low": np.nan, "2σ high": np.nan}
     for label, vol in (("GVZ (30-day constant maturity)", None if gvz is None else gvz / 100.0),
                        ("ATM IV - CBOE (selected expiry)", atm_cboe),
                        ("ATM IV - own (selected expiry)", atm_own)):
         if vol is None or not np.isfinite(vol):
-            rows.append({"Vol source": label, "Vol %": np.nan, "1σ move": np.nan,
-                         "1σ low": np.nan, "1σ high": np.nan, "2σ low": np.nan, "2σ high": np.nan})
+            rows.append({"Vol source": label, **empty})
             continue
         m = expected_move(spot, vol, t_years)
         rows.append({"Vol source": label, "Vol %": vol * 100, "1σ move": m,
                      "1σ low": spot - m, "1σ high": spot + m,
                      "2σ low": spot - 2 * m, "2σ high": spot + 2 * m})
+    label = "ATM straddle ÷ 0.798 (price-implied)"
+    if straddle_move is None or not np.isfinite(straddle_move):
+        rows.append({"Vol source": label, **empty})
+    else:
+        m = float(straddle_move)
+        rows.append({"Vol source": label, "Vol %": m / (spot * np.sqrt(max(t_years, 1e-12))) * 100,
+                     "1σ move": m, "1σ low": spot - m, "1σ high": spot + m,
+                     "2σ low": spot - 2 * m, "2σ high": spot + 2 * m})
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Narratives -- the same readings the original GEX (Options) tab gives, rebuilt
+# on this tab's data so both tabs speak the same language. Thresholds and wording
+# deliberately mirror gex_engine / streamlit_app.py (parity-tested in tests/).
+# ---------------------------------------------------------------------------
+
+NEAR_FLIP_PCT = 0.005   # same 0.5% band as gex_engine.classify_regime
+
+
+def classify_regime(net_gex: float, spot: float, gamma_flip: Optional[float]) -> str:
+    if gamma_flip is not None and abs(spot - gamma_flip) / spot < NEAR_FLIP_PCT:
+        return "Near-Flip (Transition Zone)"
+    if net_gex > 0:
+        return "Positive Gamma (Mean-Reversion Bias)"
+    return "Negative Gamma (Continuation Bias)"
+
+
+_REGIME_MEANING = {
+    "Positive": (
+        "Under this convention dealers are net LONG gamma around the current price: to stay hedged they "
+        "sell into rallies and buy dips, which dampens moves. Expect range / mean-reversion behaviour and "
+        "pinning toward large strikes; breakouts tend to fade unless flow overwhelms the hedging."
+    ),
+    "Negative": (
+        "Under this convention dealers are net SHORT gamma around the current price: hedging adds to moves "
+        "(buy as price rises, sell as it falls), so moves can extend and accelerate. Expect continuation and "
+        "larger intraday swings; support/resistance levels are less reliable than usual."
+    ),
+    "Near-Flip": (
+        "Spot sits within 0.5% of the gamma flip, so a small move can switch the hedging regime. Treat the "
+        "label as unstable \u2014 the flip level matters more than the sign of net GEX right now."
+    ),
+}
+
+
+def regime_interpretation(label: str, net_gex: float, spot: float, gamma_flip: Optional[float]) -> dict:
+    """Plain-language meaning + where spot sits relative to the flip."""
+    key = label.split(" ")[0].split("-")[0] if not label.startswith("Near") else "Near-Flip"
+    meaning = _REGIME_MEANING.get(key, "")
+    flip_text = None
+    if gamma_flip is None:
+        flip_text = ("No gamma flip found within \u00b110% of spot for this selection \u2014 net GEX keeps one sign "
+                     "across the whole tested range, so the regime read is not close to changing on a normal move.")
+    else:
+        dist = (gamma_flip - spot) / spot * 100.0
+        if net_gex > 0 and dist < 0:
+            flip_text = (f"Flip at {gamma_flip:,.2f} is {abs(dist):.2f}% BELOW spot: that is the cushion before "
+                         f"the regime would turn from positive to negative gamma on a decline.")
+        elif net_gex < 0 and dist > 0:
+            flip_text = (f"Flip at {gamma_flip:,.2f} is {dist:.2f}% ABOVE spot: price needs to rise that far "
+                         f"to get back into positive gamma.")
+        else:
+            flip_text = (f"Flip at {gamma_flip:,.2f} is {abs(dist):.2f}% {'above' if dist > 0 else 'below'} spot, "
+                         f"but net GEX has the opposite sign to what that would imply \u2014 the curve is close to flat "
+                         f"around spot, so treat both the flip and the label as low-confidence.")
+    return {"label": label, "meaning": meaning, "flip_text": flip_text}
+
+
+def concentration(gx: pd.DataFrame, tag: str) -> dict:
+    """Net vs gross GEX (same 15% / 35% cut-offs and wording as gex_engine)."""
+    net_by = gx[f"NetGEX_{tag}"]
+    gross = float(net_by.abs().sum())
+    net = float(net_by.sum())
+    ratio = abs(net) / gross if gross > 0 else 0.0
+    if ratio < 0.15:
+        text = ("Highly balanced book \u2014 calls and puts largely offset each other. The net regime label is real "
+                "but reflects a modest tilt on top of a mostly two-sided position. Low conviction from this layer alone.")
+    elif ratio < 0.35:
+        text = ("Moderately balanced book \u2014 some net tilt, but a large share of gross exposure is offsetting. "
+                "Treat the regime label as a moderate-confidence secondary input, not a dominant signal.")
+    else:
+        text = ("Lopsided book \u2014 net GEX represents a large share of gross exposure. This is a higher-conviction "
+                "directional/regime reading than the typical case.")
+    return {"gross_gex": gross, "net_gex": net, "ratio": ratio, "narrative": text}
+
+
+def dealer_delta_context(dealer_delta_value: float, avg_volume_10d: Optional[float]) -> dict:
+    """Dealer delta vs GLD's 10-day average volume (same <10% / 10-40% / >40% wording)."""
+    out = {"dealer_delta": dealer_delta_value, "avg_volume_10d": avg_volume_10d, "ratio": None, "size_narrative": None}
+    if avg_volume_10d and avg_volume_10d > 0:
+        ratio = abs(dealer_delta_value) / avg_volume_10d
+        out["ratio"] = ratio
+        if ratio < 0.10:
+            out["size_narrative"] = ("Small relative to normal trading size \u2014 background noise, unlikely to be a "
+                                     "meaningful factor on its own.")
+        elif ratio < 0.40:
+            out["size_narrative"] = ("Moderate relative to normal trading size \u2014 worth weighting as a secondary "
+                                     "confirming/contradicting check against your macro view, not a standalone signal.")
+        else:
+            out["size_narrative"] = ("Large relative to normal trading size \u2014 this dealer positioning is substantial "
+                                     "enough to be a meaningful secondary input.")
+    out["direction_narrative"] = (
+        "Dealers are net long delta (positive) \u2014 a mild bullish-leaning tilt in the book. Static exposure, not an "
+        "active hedging force by itself (that's gamma's job) \u2014 read it as a confirming/contradicting check against "
+        "your macro thesis, not a trigger."
+        if dealer_delta_value > 0 else
+        "Dealers are net short delta (negative) \u2014 a mild bearish-leaning tilt in the book. Static exposure, not an "
+        "active hedging force by itself (that's gamma's job) \u2014 read it as a confirming/contradicting check against "
+        "your macro thesis, not a trigger."
+    )
+    return out
+
+
+def nearest_clusters(gx: pd.DataFrame, spot: float, tag: str, window_pct: float = 0.08,
+                     magnitude_frac: float = 0.20, top_n: int = 6) -> pd.DataFrame:
+    """Same algorithm as find_nearest_gex_clusters in the app: strikes close to spot that
+    ALSO carry a real concentration (>= magnitude_frac of the window's largest gross GEX)."""
+    if gx is None or gx.empty:
+        return pd.DataFrame()
+    w = gx[(gx.index >= spot * (1 - window_pct)) & (gx.index <= spot * (1 + window_pct))].copy()
+    if w.empty:
+        return pd.DataFrame()
+    w["CallGEX"] = w[f"CallGEX_{tag}"]
+    w["PutGEX"] = w[f"PutGEX_{tag}"]
+    w["GrossGEX"] = w["CallGEX"].abs() + w["PutGEX"].abs()
+    cand = w[w["GrossGEX"] >= w["GrossGEX"].max() * magnitude_frac].copy()
+    if cand.empty:
+        return pd.DataFrame()
+    cand["DistFromSpot"] = cand.index - spot
+    cand["AbsDistFromSpot"] = cand["DistFromSpot"].abs()
+    return cand.sort_values("AbsDistFromSpot").head(top_n)[["CallGEX", "PutGEX", "GrossGEX", "DistFromSpot"]]
+
+
+def cluster_lean(call_gex: float, put_gex: float, gross_gex: float) -> str:
+    net = call_gex + put_gex
+    if abs(call_gex) > abs(put_gex) * 1.3:
+        return "call-dominant"
+    if abs(put_gex) > abs(call_gex) * 1.3:
+        return "put-dominant"
+    if gross_gex > 0 and abs(net) < gross_gex * 0.3:
+        return "two-sided / battleground (large call AND put both, net mostly cancels)"
+    return "mixed call/put"
+
+
+def cluster_side(dist: float) -> str:
+    if dist > 0:
+        return "above spot (resistance-leaning)"
+    if dist < 0:
+        return "below spot (support-leaning)"
+    return "essentially AT spot (pin risk)"
+
+
+def clusters_as_records(gx: pd.DataFrame, spot: float, tag: str) -> list:
+    c = nearest_clusters(gx, spot, tag)
+    out = []
+    for strike, row in c.iterrows():
+        out.append({
+            "strike": float(strike), "dist": float(row["DistFromSpot"]),
+            "pct_away": float(row["DistFromSpot"] / spot * 100.0),
+            "call_gex": float(row["CallGEX"]), "put_gex": float(row["PutGEX"]),
+            "gross_gex": float(row["GrossGEX"]), "net_gex": float(row["CallGEX"] + row["PutGEX"]),
+            "side": cluster_side(float(row["DistFromSpot"])),
+            "lean": cluster_lean(float(row["CallGEX"]), float(row["PutGEX"]), float(row["GrossGEX"])),
+        })
+    return out
+
+
+def raw_walls(gx: pd.DataFrame, tag: str, top_n: int = 3) -> dict:
+    """Unfiltered by spot (can surface the ATM strike on both sides) -- diagnostic, like the original."""
+    cw = gx[f"CallGEX_{tag}"].sort_values(ascending=False).head(top_n)
+    pw = gx[f"PutGEX_{tag}"].abs().sort_values(ascending=False).head(top_n)
+    return {"call_walls": [(float(k), float(v)) for k, v in cw.items()],
+            "put_walls": [(float(k), float(v)) for k, v in pw.items()]}
+
+
+def range_context(levels: dict, spot: float, move: Optional[float], move_label: str) -> list:
+    """Which walls sit inside today's expected range -- i.e. which are 'in play'."""
+    if move is None or not np.isfinite(move) or move <= 0:
+        return []
+    out = []
+    for name, lst in (("resistance", levels.get("resistance", [])), ("support", levels.get("support", []))):
+        if not lst:
+            out.append(f"No {name} wall found on that side of spot in this selection.")
+            continue
+        k = lst[0][0]
+        dist = abs(k - spot)
+        sig = dist / move
+        pct = (k - spot) / spot * 100.0
+        if sig <= 1.0:
+            verdict = f"INSIDE the 1\u03c3 band ({sig:.2f}\u03c3) \u2014 realistically in play for this horizon"
+        elif sig <= 2.0:
+            verdict = f"between 1\u03c3 and 2\u03c3 ({sig:.2f}\u03c3) \u2014 needs a larger-than-expected move"
+        else:
+            verdict = f"beyond 2\u03c3 ({sig:.2f}\u03c3) \u2014 unlikely to matter for this horizon"
+        out.append(f"Nearest {name} wall {k:,.2f} ({pct:+.2f}% from spot) is {verdict} [band: {move_label}].")
+    return out
+
+
+def build_read(view: dict, spot: float, move: Optional[float], move_label: str) -> list:
+    """The 'what this adds up to' list. Each item: {'level': 'good'|'info'|'warn', 'text': str}.
+    Heuristic reading aids, not signals -- same stance as the original tab."""
+    items = []
+    rc, ro = view["regime_cboe"], view["regime_own"]
+    if rc["label"] == ro["label"]:
+        items.append({"level": "info", "text": f"Both Greek sets agree: **{ro['label']}**. {ro['meaning']}"})
+    else:
+        items.append({"level": "warn", "text":
+                      f"The Greek sets DISAGREE on the regime \u2014 CBOE Greeks: **{rc['label']}**; self-calculated: "
+                      f"**{ro['label']}**. Don't lean on the label until that is explained (see the deviation block)."})
+        items.append({"level": "info", "text": f"Self-calculated reading: {ro['meaning']}"})
+    for who, r_ in (("CBOE-IV", rc), ("own-IV", ro)):
+        if r_.get("flip_text"):
+            items.append({"level": "info", "text": f"Flip ({who} model): {r_['flip_text']}"})
+            break
+    conc = view["concentration_own"]
+    items.append({"level": "info", "text": f"Book shape: net/gross {conc['ratio']:.0%}. {conc['narrative']}"})
+    dd = view["dealer_delta_own"]
+    items.append({"level": "info", "text": ("Net dealer delta is " + ("long" if dd > 0 else "short") +
+                                            f" ({dd:,.0f} shares) \u2014 static tilt, not a trigger.")})
+    for t in range_context(view["levels_own"], spot, move, move_label):
+        items.append({"level": "info", "text": t})
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -501,7 +752,7 @@ def compute_view(enriched: pd.DataFrame, spot: float, r: float, mode: str,
         far = sel["Expiration"].max()
         atm_src = sel[sel["Expiration"] == far]
 
-    return {
+    out = {
         "key": view_key(mode, expiry, max_dte),
         "label": label,
         "mode": mode,
@@ -523,8 +774,19 @@ def compute_view(enriched: pd.DataFrame, spot: float, r: float, mode: str,
         "atm_iv_cboe": atm_iv(atm_src, spot, "IV_cboe"),
         "atm_iv_own": atm_iv(atm_src, spot, "IV_own"),
         "deviation": deviation_summary(sel),
+        "straddle": atm_straddle_move(atm_src, spot),
         "selection_df": sel,   # not serialised
     }
+    fo, fc = out["flip_own_iv"], out["flip_cboe_iv"]
+    out["regime_own"] = regime_interpretation(classify_regime(out["net_gex_own"], spot, fo), out["net_gex_own"], spot, fo)
+    out["regime_cboe"] = regime_interpretation(classify_regime(out["net_gex_cboe"], spot, fc), out["net_gex_cboe"], spot, fc)
+    out["concentration_own"] = concentration(gx, "own")
+    out["concentration_cboe"] = concentration(gx, "cboe")
+    out["clusters_own"] = clusters_as_records(gx, spot, "own")
+    out["clusters_cboe"] = clusters_as_records(gx, spot, "cboe")
+    out["raw_walls_own"] = raw_walls(gx, "own")
+    out["raw_walls_cboe"] = raw_walls(gx, "cboe")
+    return out
 
 
 def standard_view_specs(exp_table: pd.DataFrame, n_single: int = 6, cum_days=(7, 14, 30)) -> list[dict]:
@@ -536,8 +798,19 @@ def standard_view_specs(exp_table: pd.DataFrame, n_single: int = 6, cum_days=(7,
     return specs
 
 
+def fetch_avg_volume_10d(symbol: str = "GLD") -> Optional[float]:
+    """10-day average share volume (yfinance) for the dealer-delta-vs-volume narrative."""
+    try:
+        import yfinance as yf
+        h = yf.Ticker(symbol).history(period="10d")
+        return float(h["Volume"].mean()) if not h.empty else None
+    except Exception:
+        return None
+
+
 def build_snapshot_payload(symbol: str, spot: float, meta: dict, enriched: pd.DataFrame, r: float,
-                           r_note: str, gvz: Optional[float], own_iv_basis: str) -> dict:
+                           r_note: str, gvz: Optional[float], own_iv_basis: str,
+                           avg_volume: Optional[float] = None, basis: Optional[dict] = None) -> dict:
     """Compact, JSON-safe record of the standard views -- what gets stored as
     the 'last good' fallback for this tab."""
     import gex_snapshot as gs
@@ -563,5 +836,7 @@ def build_snapshot_payload(symbol: str, spot: float, meta: dict, enriched: pd.Da
         "r_note": r_note,
         "own_iv_basis": own_iv_basis,
         "source_url": meta.get("url"),
+        "avg_volume_10d": avg_volume,
+        "basis_at_save": basis,
         "views": views,
     }

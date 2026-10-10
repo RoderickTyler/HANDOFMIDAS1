@@ -38,6 +38,8 @@ import gold_comparison
 import live_quotes
 import gex_snapshot
 import gex_alt
+import gld_basis
+import spot_history
 import macro_confidence
 
 st.set_page_config(
@@ -420,6 +422,46 @@ def load_risk_free():
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def load_spot_history_chain(period: str, _reference, live_price):
+    """ADDITIVE: validated TRUE-spot daily history (yfinance -> Dukascopy -> Stooq), checked against the GC=F
+    reference so a wrong series is rejected rather than plotted. Display only -- nothing else uses it."""
+    try:
+        return spot_history.get_spot_history(period, reference=_reference, live_price=live_price)
+    except Exception as e:
+        return {"series": None, "source": None, "notes": [f"spot history chain error: {e}"],
+                "shift_days": 0, "corr": None, "ratio": None, "live_point": False}
+
+
+BASIS_CACHE_TTL = 15 * 60  # GLD/XAUUSD basis is re-captured every 15 min (matches the regime logger cadence)
+
+
+@st.cache_data(ttl=BASIS_CACHE_TTL, show_spinner=False)
+def load_basis_live():
+    """FAST cadence: GLD / XAUUSD / GC=F basis point. Never raises."""
+    return gld_basis.fetch_basis_snapshot()
+
+
+@st.cache_data(ttl=5 * 60, show_spinner=False)
+def load_basis_history():
+    """Logged 15-min basis points written by the scheduled job to the data branch."""
+    return gld_basis.fetch_remote_points()
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def load_avg_volume_10d(symbol: str):
+    return gex_alt.fetch_avg_volume_10d(symbol)
+
+
+def load_stable_oz_per_share():
+    """The existing 24h-cached oz/share (gold_comparison), or None. Not cached here on purpose --
+    gold_comparison does its own 24h caching."""
+    try:
+        return float(gold_comparison.get_oz_per_share())
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def load_smoothed_regime(_signals: pd.DataFrame):
     """ADDITIVE: the same fair-smoothing refit the Regime tab's Option 2 runs
     on a button, cached so the Macro Confidence tab can reuse it."""
@@ -627,16 +669,25 @@ with tabs[0]:
     col8.metric("30d Corr Gold/DXY", f"{corr_dxy:+.2f}" if corr_dxy is not None else "n/a", help="Expected negative")
 
     st.markdown("#### Price history")
-    spot_history = load_spot_history(period)
-    chart_df = pd.DataFrame(index=signals.index)
-    if spot_history is not None:
-        chart_df["Gold Spot (XAUUSD)"] = spot_history.reindex(chart_df.index)
-        gold_chart_note = "Showing true spot gold (XAUUSD), not the futures contract."
+    _live_px = spot_result["price"] if spot_result is not None else None
+    _ref = signals["gold_spot"] if "gold_spot" in signals.columns else None
+    spot_info = load_spot_history_chain(period, _ref, _live_px)
+    spot_series = spot_info["series"]
+    if spot_series is not None:
+        chart_df = pd.DataFrame(index=signals.index.union(spot_series.index))
+        chart_df["Gold Spot (XAUUSD)"] = spot_series
+        gold_chart_note = (
+            f"Showing true spot gold (XAUUSD), not the futures contract. Source: {spot_info['source']}"
+            + ("; last point = live pulled spot" if spot_info["live_point"] else "")
+            + (f"; validated against GC=F (return correlation {spot_info['corr']:.3f}, median spot/futures ratio {spot_info['ratio']:.3f})"
+               if spot_info.get("corr") is not None else "") + "."
+        )
     else:
+        chart_df = pd.DataFrame(index=signals.index)
         chart_df["Gold (GC=F futures)"] = signals["gold_spot"] if "gold_spot" in signals.columns else None
         gold_chart_note = (
-            "Couldn't fetch true spot gold (XAUUSD=X) this run, so this is showing "
-            "GC=F futures instead \u2014 they track closely but aren't identical."
+            "No spot-gold history source passed validation this run, so this is showing GC=F futures instead "
+            "\u2014 they track closely but aren't identical. Tried: " + " | ".join(spot_info["notes"] or ["nothing returned"])
         )
     if "dxy" in signals.columns:
         chart_df["DXY"] = signals["dxy"]
@@ -644,6 +695,8 @@ with tabs[0]:
     if not chart_df.empty:
         st.line_chart(chart_df)
     st.caption(gold_chart_note)
+    if spot_series is not None and spot_info["notes"]:
+        st.caption("Spot sources skipped: " + " | ".join(spot_info["notes"]))
 
     st.markdown("#### Divergence flags")
     st.caption("Where the textbook gold-vs-DXY / gold-vs-real-yield relationship may be breaking down.")
@@ -1663,43 +1716,162 @@ with macro_conf_tab:
 
 # ===========================================================================
 # ADDITIVE: GEX (Alternative) tab -- CBOE + GVZ, no MarketData.app
+#
+# Two cadences, kept separate on purpose:
+#   * option chain / GEX snapshot -> original GEX timing (GEX_CACHE_TTL, 10 min in-app;
+#     the scheduled job also stores one every ~30 min as the fallback)
+#   * GLD<->spot basis            -> every 15 min (BASIS_CACHE_TTL + scheduled job),
+#     used only to translate GLD levels into XAUUSD terms
 # ===========================================================================
 
 def _fmt_level(x):
     return "not found" if x is None else f"{x:,.2f}"
 
 
-def _render_gex_alt_view(view, spot, gvz, sym, contracts=None):
-    """Renders one DTE selection. `view` is the dict from gex_alt.compute_view
-    (live) or its stored/JSON form (snapshot fallback); `contracts` is the
-    contract-level frame, only available live."""
+def _to_xau(level, factor):
+    return None if (level is None or factor is None) else level * factor
+
+
+def _basis_panel(basis_choice, live_pt, history, stable_oz, chain_spot=None):
+    """Shows the basis in use, how it compares with the 24h-stable oz/share, and its recent history."""
+    st.markdown("#### GLD → spot-gold basis (15-minute capture)")
+    st.caption(
+        "Strikes don't move, but the factor that turns a GLD level into a $/oz level does. The original tab uses "
+        "an oz/share ratio cached for 24h (stable on purpose). This panel also captures the LIVE GLD ÷ XAUUSD ratio "
+        "every 15 minutes, so you can see whether the stable ratio has drifted from the market, and how many dollars "
+        "of $/oz that is worth. GLD trades US hours only while spot trades ~24h, so a ratio taken while GLD is closed "
+        "would show a fake basis move — those points are stored but never used to convert."
+    )
+    pt = basis_choice.get("point") or live_pt or {}
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("GLD", f"{pt['gld']:,.2f}" if pt.get("gld") else "n/a")
+    c2.metric("XAUUSD (spot)", f"{pt['xau']:,.2f}" if pt.get("xau") else "n/a")
+    c3.metric("Live oz/share (GLD÷XAU)", f"{pt['ratio']:.6f}" if pt.get("ratio") else "n/a")
+    c4.metric("24h-stable oz/share", f"{stable_oz:.6f}" if stable_oz else "n/a")
+    gcb = pt.get("gc_basis_pct")
+    c5.metric("GC=F − spot basis", f"{gcb:+.2f}%" if gcb is not None else "n/a")
+
+    st.markdown("**Spot price: pulled vs self-calculated, with the deviation**")
+    st.caption(
+        "PULLED = XAUUSD straight from the gold-api feed. SELF-CALCULATED = GLD price ÷ the 24h-stable oz/share "
+        "(what the original GEX tab uses). The deviation columns are measured against the pulled spot. A self-calculated "
+        "row is withheld while GLD isn't trading, because GLD's stale price against a live spot would be a fake gap."
+    )
+    _rr = pd.DataFrame(gld_basis.reconcile_rows(pt, stable_oz, chain_spot))
+    st.dataframe(_rr.round(2), hide_index=True, use_container_width=True)
+    _sc = _rr[_rr["Measure"].str.contains("SELF")]
+    if len(_sc) and _sc.iloc[0]["Value"] == _sc.iloc[0]["Value"] and _sc.iloc[0]["Value"] is not None:
+        _d = _sc.iloc[0]["Dev vs pulled ($/oz)"]
+        st.caption(
+            f"Self-calculated spot is {_d:+.2f} $/oz ({_sc.iloc[0]['Dev vs pulled (bps)']:+.1f} bps) from the pulled spot right now. "
+            f"Any level converted with the stable ratio carries roughly that much error at today's price."
+        )
+
+    src = basis_choice["source"]
+    if src == "none":
+        st.warning("No basis available — spot-equivalent levels are unavailable this run.")
+    else:
+        when, age = (gex_snapshot.describe_age(basis_choice["point"]["ts_utc"]) if basis_choice.get("point") else ("n/a", "n/a"))
+        st.info(f"Converting with: **{basis_choice['note']}** — captured {when} ({age}).")
+        if pt.get("ratio") and stable_oz:
+            diff_bps = (pt["ratio"] / stable_oz - 1) * 1e4
+            lvl = pt.get("xau") or 0
+            st.caption(
+                f"Live ratio vs 24h-stable: {diff_bps:+.1f} bps → about ${abs(diff_bps) / 1e4 * lvl:,.2f}/oz on a level at "
+                f"{lvl:,.0f}. If that is small the stable ratio is fine; if it grows, the faster basis is doing real work."
+            )
+    if live_pt and not live_pt.get("ratio_valid"):
+        st.caption("Live pairing not valid right now (GLD hasn't printed recently — market closed or halted), so the last valid point is used.")
+    if live_pt and live_pt.get("errors"):
+        st.caption("Basis capture notes: " + " | ".join(live_pt["errors"]))
+
+    valid = [p for p in (history or []) if p.get("ratio_valid") and p.get("ratio")]
+    if len(valid) >= 2:
+        hdf = pd.DataFrame({"oz/share (live)": [p["ratio"] for p in valid]},
+                           index=pd.to_datetime([p["ts_utc"] for p in valid], utc=True).tz_convert("Asia/Singapore"))
+        st.markdown("**Logged live oz/share (SGT)**")
+        st.line_chart(hdf)
+        gcs = [(p["ts_utc"], p["gc_basis_pct"]) for p in (history or []) if p.get("gc_basis_pct") is not None]
+        if len(gcs) >= 2:
+            st.markdown("**Logged GC=F − spot basis, % (SGT)**")
+            st.line_chart(pd.DataFrame({"GC basis %": [v for _, v in gcs]},
+                                       index=pd.to_datetime([t for t, _ in gcs], utc=True).tz_convert("Asia/Singapore")))
+        _ds = gld_basis.deviation_series(history, stable_oz)
+        if len(_ds) >= 2:
+            st.markdown("**Logged deviation: self-calculated − pulled spot, $/oz (SGT)**")
+            st.line_chart(pd.DataFrame({"self-calculated − pulled ($/oz)": [v for _, v in _ds]},
+                                       index=pd.to_datetime([t for t, _ in _ds], utc=True).tz_convert("Asia/Singapore")))
+            _vals = [v for _, v in _ds]
+            st.caption(f"Over {len(_vals)} logged points: mean {sum(_vals) / len(_vals):+.2f}, range {min(_vals):+.2f} to {max(_vals):+.2f} $/oz.")
+    else:
+        st.caption("Basis history will appear here once the scheduled job has logged a few 15-minute points.")
+
+
+def _render_gex_alt_view(view, spot, gvz, sym, contracts=None, basis=None, stable_oz=None, avg_volume=None):
+    """One DTE selection. `view` is gex_alt.compute_view output (live) or its JSON round-trip (snapshot).
+    basis = gld_basis.choose_basis(...) result; spot-equivalent columns appear when it has a factor."""
     gx = view["gex"] if isinstance(view["gex"], pd.DataFrame) else gex_snapshot.df_from_json(view["gex"])
     t_years = view["t_years"]
+    f = (basis or {}).get("spot_per_gld")                       # $/oz per GLD $
+    f_stable = (1.0 / stable_oz) if stable_oz else None
+    has_narr = "regime_own" in view                              # old snapshots predate the narratives
 
-    # --- Expected range -----------------------------------------------------
+    # the expected-move used for "is this wall in play"
+    move, move_label = None, ""
+    if view.get("straddle"):
+        move, move_label = view["straddle"]["one_sigma"], "ATM straddle 1σ"
+    elif view.get("atm_iv_own"):
+        move, move_label = gex_alt.expected_move(spot, view["atm_iv_own"], t_years), "own ATM-IV 1σ"
+    elif gvz is not None:
+        move, move_label = gex_alt.expected_move(spot, gvz / 100.0, t_years), "GVZ 1σ"
+
+    # ---- 1. What it adds up to ------------------------------------------------
+    if has_narr:
+        st.markdown("#### What this adds up to")
+        st.caption("Reading aids built from the numbers below — heuristics, not signals. Same stance as the original GEX tab.")
+        for it in gex_alt.build_read(view, spot, move, move_label):
+            (st.warning if it["level"] == "warn" else st.markdown)(it["text"] if it["level"] == "warn" else f"- {it['text']}")
+
+        st.markdown("#### Gamma regime")
+        rc1, rc2 = st.columns(2)
+        for col, title, key, flipkey in ((rc1, "CBOE Greeks", "regime_cboe", "flip_cboe_iv"),
+                                         (rc2, "Self-calculated Greeks", "regime_own", "flip_own_iv")):
+            with col:
+                r_ = view[key]
+                st.markdown(f"**{title}**")
+                st.metric("Regime", r_["label"].split(" (")[0])
+                st.caption(r_["label"])
+                st.caption(r_["meaning"])
+                if r_.get("flip_text"):
+                    st.caption(r_["flip_text"])
+                    if (f or f_stable) and view.get(flipkey):
+                        _p = f"{view[flipkey] * f:,.0f}" if f else "n/a"
+                        _c = f"{view[flipkey] * f_stable:,.0f}" if f_stable else "n/a"
+                        st.caption(f"Flip in spot-gold terms: ≈ {_p} (pulled basis) | {_c} (self-calculated) XAUUSD")
+
+    # ---- 2. Expected range ----------------------------------------------------
     st.markdown("#### Expected range for this DTE")
     st.caption(
-        "1σ move = Spot × vol × √T (T in years to the selected expiry, or to the cumulative DTE). "
-        "GVZ is CBOE's 30-day constant-maturity implied vol on GLD options, so it is a *30-day* number applied to "
-        "a shorter horizon; the ATM-IV rows are term-specific. Implied vol usually runs above realised vol, so "
-        "these ranges tend to be wider than what actually happens. 1σ ≈ 68% only if returns were normal — "
-        "gold's tails are fatter than that."
+        "1σ move = Spot × vol × √T (T in years to the expiry, or to the cumulative DTE). GVZ is CBOE's 30-day "
+        "constant-maturity implied vol on GLD options, so it is a *30-day* number applied to a shorter horizon; the "
+        "ATM rows are term-specific. The straddle row is read straight off traded prices (ATM call + put ≈ 0.798σ√T·S), "
+        "so it needs no vol or time convention — if it disagrees with the IV rows, trust it over them. Implied vol usually "
+        "runs above realised vol, so these ranges tend to be wider than what actually happens; 1σ ≈ 68% only for "
+        "normal returns, and gold's tails are fatter."
     )
-    rt = gex_alt.range_table(spot, t_years, gvz, view.get("atm_iv_cboe"), view.get("atm_iv_own"))
+    sm = view.get("straddle")
+    rt = gex_alt.range_table(spot, t_years, gvz, view.get("atm_iv_cboe"), view.get("atm_iv_own"),
+                             None if not sm else sm["one_sigma"])
+    for c_ in ("1σ low", "1σ high"):
+        if f:
+            rt[c_ + " (XAUUSD, pulled basis)"] = rt[c_] * f
+        if f_stable:
+            rt[c_ + " (XAUUSD, self-calc)"] = rt[c_] * f_stable
     st.dataframe(rt.round(2), hide_index=True, use_container_width=True)
-    if gvz is not None and sym == "GLD":
-        try:
-            oz = gold_comparison.get_oz_per_share()
-            m = gex_alt.expected_move(spot, gvz / 100.0, t_years)
-            st.caption(
-                f"GVZ 1σ band in spot-gold terms (÷ oz/share {oz:.6f}): "
-                f"≈ {(spot - m) / oz:,.0f} – {(spot + m) / oz:,.0f} XAUUSD. "
-                f"Proxy conversion — see the original GEX tab for the caveats."
-            )
-        except Exception:
-            pass
+    if sm:
+        st.caption(f"Straddle uses the {sm['strike']:,.2f} strike: premium {sm['straddle']:.2f} → 1σ ≈ {sm['one_sigma']:.2f} GLD $.")
 
-    # --- Side-by-side GEX ---------------------------------------------------
+    # ---- 3. Side-by-side GEX --------------------------------------------------
     st.markdown("#### Dealer gamma: CBOE Greeks vs self-calculated Greeks")
     st.caption(
         "Same open interest and the same sign convention (calls +, puts −; dealers assumed short both — an "
@@ -1708,24 +1880,17 @@ def _render_gex_alt_view(view, spot, gvz, sym, contracts=None):
     )
     lo, hi = spot * 0.92, spot * 1.08
     cc, oc = st.columns(2)
-    with cc:
-        st.markdown("**CBOE Greeks**")
-        st.metric("Net GEX", f"{view['net_gex_cboe']:,.0f}")
-        st.metric("Gamma flip (our model, CBOE IV)", _fmt_level(view["flip_cboe_iv"]))
-        st.metric("Dealer delta (shares)", f"{view['dealer_delta_cboe']:,.0f}")
-        lv = view["levels_cboe"]
-        st.write(f"Call wall: **{_fmt_level(lv['call_wall'])}**  ·  Put wall: **{_fmt_level(lv['put_wall'])}**  ·  ATM pin: **{_fmt_level(lv['atm_pin'])}**")
-        st.write("Resistance (above spot): " + (", ".join(f"{k:,.2f}" for k, _ in lv["resistance"]) or "none"))
-        st.write("Support (below spot): " + (", ".join(f"{k:,.2f}" for k, _ in lv["support"]) or "none"))
-    with oc:
-        st.markdown("**Self-calculated Greeks**")
-        st.metric("Net GEX", f"{view['net_gex_own']:,.0f}")
-        st.metric("Gamma flip (our model, our IV)", _fmt_level(view["flip_own_iv"]))
-        st.metric("Dealer delta (shares)", f"{view['dealer_delta_own']:,.0f}")
-        lv = view["levels_own"]
-        st.write(f"Call wall: **{_fmt_level(lv['call_wall'])}**  ·  Put wall: **{_fmt_level(lv['put_wall'])}**  ·  ATM pin: **{_fmt_level(lv['atm_pin'])}**")
-        st.write("Resistance (above spot): " + (", ".join(f"{k:,.2f}" for k, _ in lv["resistance"]) or "none"))
-        st.write("Support (below spot): " + (", ".join(f"{k:,.2f}" for k, _ in lv["support"]) or "none"))
+    for col, title, tag, flipkey, ddkey, lvkey in ((cc, "CBOE Greeks", "cboe", "flip_cboe_iv", "dealer_delta_cboe", "levels_cboe"),
+                                                    (oc, "Self-calculated Greeks", "own", "flip_own_iv", "dealer_delta_own", "levels_own")):
+        with col:
+            st.markdown(f"**{title}**")
+            st.metric("Net GEX", f"{view['net_gex_' + tag]:,.0f}")
+            st.metric("Gamma flip (our model, " + ("CBOE IV" if tag == "cboe" else "our IV") + ")", _fmt_level(view[flipkey]))
+            st.metric("Dealer delta (shares)", f"{view[ddkey]:,.0f}")
+            lv = view[lvkey]
+            st.write(f"Call wall: **{_fmt_level(lv['call_wall'])}**  ·  Put wall: **{_fmt_level(lv['put_wall'])}**  ·  ATM pin: **{_fmt_level(lv['atm_pin'])}**")
+            st.write("Resistance (above spot): " + (", ".join(f"{k:,.2f}" for k, _ in lv["resistance"]) or "none"))
+            st.write("Support (below spot): " + (", ".join(f"{k:,.2f}" for k, _ in lv["support"]) or "none"))
 
     base = view["net_gex_cboe"]
     if base:
@@ -1748,7 +1913,99 @@ def _render_gex_alt_view(view, spot, gvz, sym, contracts=None):
             st.dataframe(win[["CallGEX_cboe", "PutGEX_cboe", "CallGEX_own", "PutGEX_own", "CallOI", "PutOI"]].round(0),
                          use_container_width=True)
 
-    # --- Deviation ----------------------------------------------------------
+    # ---- 4. Nearest significant clusters -------------------------------------
+    if has_narr:
+        st.markdown("#### Nearest significant GEX clusters")
+        st.caption(
+            "The closest-to-spot strikes that still show a real GEX concentration (≥20% of the largest gross GEX within ±8% of spot), "
+            "ranked by gross exposure — filters out small/noise strikes so the list favours visually significant bars near spot. "
+            "Based on the self-calculated Greeks; the CBOE-Greeks version is in the expander."
+        )
+
+        def _cluster_lines(recs):
+            if not recs:
+                st.caption("Nothing near spot cleared the meaningful-size threshold this run.")
+            for c_ in recs:
+                line = (f"**{c_['strike']:.2f}** ({c_['pct_away']:+.2f}% from spot, {c_['side']}, {c_['lean']}) — "
+                        f"Gross GEX {c_['gross_gex']:,.0f} (Net {c_['net_gex']:,.0f})")
+                if f or f_stable:
+                    _p = f"{c_['strike'] * f:,.0f}" if f else "n/a"
+                    _c = f"{c_['strike'] * f_stable:,.0f}" if f_stable else "n/a"
+                    line += f"  → XAUUSD ≈ **{_p}** (pulled basis) | **{_c}** (self-calculated)"
+                st.markdown(line)
+        _cluster_lines(view["clusters_own"])
+        with st.expander("Same list using CBOE's Greeks"):
+            _cluster_lines(view["clusters_cboe"])
+
+    # ---- 5. Levels in spot-gold terms: PULLED basis vs SELF-CALCULATED, side by side ----------
+    st.markdown("#### Spot Gold Equivalent (proxy) — pulled basis vs self-calculated")
+    st.caption(
+        "Every GLD level is converted two ways and shown next to each other. PULLED BASIS = level × (pulled XAUUSD ÷ live GLD), "
+        "i.e. anchored to the spot price actually pulled from the feed. SELF-CALCULATED = level ÷ the 24h-stable oz/share. "
+        "Δ is pulled − calculated in $/oz: that is how far the two methods disagree about where the wall sits in spot terms. "
+        "This is a PROXY — GLD's own levels converted to spot units — not observed COMEX/spot options data."
+    )
+    if not f and not f_stable:
+        st.caption("No basis or oz/share available this run, so the conversion is skipped.")
+    else:
+        def _conv(level):
+            p_ = _to_xau(level, f)
+            c_ = _to_xau(level, f_stable)
+            d_ = (p_ - c_) if (p_ is not None and c_ is not None) else None
+            b_ = (d_ / c_ * 1e4) if (d_ is not None and c_) else None
+            return p_, c_, d_, b_
+        rows = []
+        def add(name, own, cb, g_own=None, g_cb=None):
+            for tag, lvl, g_ in (("Self-calc Greeks", own, g_own), ("CBOE Greeks", cb, g_cb)):
+                if lvl is None:
+                    continue
+                p_, c_, d_, b_ = _conv(lvl)
+                rows.append({"Level": name, "Greeks": tag, "GLD": lvl,
+                             "XAUUSD — pulled basis": p_, "XAUUSD — self-calculated": c_,
+                             "Δ pulled − calc ($/oz)": d_, "Δ (bps)": b_, "GEX": g_})
+        lo_, lc_ = view["levels_own"], view["levels_cboe"]
+        add("Spot (chain)", spot, spot)
+        add("Gamma flip", view["flip_own_iv"], view["flip_cboe_iv"])
+        add("ATM pin", lo_["atm_pin"], lc_["atm_pin"])
+        add("Call wall", lo_["call_wall"], lc_["call_wall"])
+        add("Put wall", lo_["put_wall"], lc_["put_wall"])
+        for i_ in range(max(len(lo_["resistance"]), len(lc_["resistance"]))):
+            o_ = lo_["resistance"][i_] if i_ < len(lo_["resistance"]) else (None, None)
+            c_ = lc_["resistance"][i_] if i_ < len(lc_["resistance"]) else (None, None)
+            add(f"Resistance {i_ + 1}", o_[0], c_[0], o_[1], c_[1])
+        for i_ in range(max(len(lo_["support"]), len(lc_["support"]))):
+            o_ = lo_["support"][i_] if i_ < len(lo_["support"]) else (None, None)
+            c_ = lc_["support"][i_] if i_ < len(lc_["support"]) else (None, None)
+            add(f"Support {i_ + 1}", o_[0], c_[0], o_[1], c_[1])
+        st.dataframe(pd.DataFrame(rows).round(2), hide_index=True, use_container_width=True)
+        if f and f_stable:
+            st.caption(
+                f"The two factors differ by {(f / f_stable - 1) * 1e4:+.1f} bps → about ${abs(f / f_stable - 1) * spot * f:,.2f}/oz at spot. "
+                f"If that is small, either column is fine; if it is large, trust the pulled basis (it is anchored to the live spot)."
+            )
+        elif not f_stable:
+            st.caption("Self-calculated column unavailable: no oz/share value this run.")
+        elif not f:
+            st.caption("Pulled-basis column unavailable: no valid live/logged basis this run.")
+
+    # ---- 6. Dealer positioning context ---------------------------------------
+    if has_narr:
+        st.markdown("#### Dealer positioning context")
+        cn_o, cn_c = view["concentration_own"], view["concentration_cboe"]
+        st.write(f"**GEX concentration:** net/gross ratio {cn_o['ratio']:.1%} (gross {cn_o['gross_gex']:,.0f}, net {cn_o['net_gex']:,.0f}) — self-calculated Greeks")
+        st.caption(cn_o["narrative"])
+        if abs(cn_o["ratio"] - cn_c["ratio"]) > 0.10:
+            st.caption(f"CBOE-Greeks ratio is {cn_c['ratio']:.1%} — the two Greek sets disagree on how lopsided the book is.")
+        dctx = gex_alt.dealer_delta_context(view["dealer_delta_own"], avg_volume)
+        if dctx["ratio"] is not None:
+            st.write(f"**Dealer delta vs. 10-day avg volume:** {dctx['ratio']:.1%} ({dctx['dealer_delta']:,.0f} vs {dctx['avg_volume_10d']:,.0f})")
+            st.caption(dctx["size_narrative"])
+        else:
+            st.caption("Dealer delta / volume comparison unavailable this run (no volume data).")
+        st.caption(dctx["direction_narrative"])
+        st.caption("Selection-specific: this covers only the expiries you picked above, not the whole chain.")
+
+    # ---- 7. Deviation --------------------------------------------------------
     st.markdown("#### How far apart are the Greeks?")
     dv = view.get("deviation") or {}
     if not dv.get("n"):
@@ -1762,22 +2019,35 @@ def _render_gex_alt_view(view, spot, gvz, sym, contracts=None):
         d3.metric("Median |ΔGamma|", _nf(dv.get("median_abs_dGamma_pct"), ".1f") + "%")
         d4.metric("OI-wtd Gamma own/CBOE", _nf(dv.get("oi_wtd_gamma_ratio_own_over_cboe"), ".3f"))
         st.caption(
-            f"{dv['n']} contracts with open interest. A gamma ratio far from 1.000 means one side is "
-            f"systematically bigger, which scales every GEX number. Differences come from: IV (we back ours out "
-            f"of the bid/ask mid), time-to-expiry convention, the rate used, and CBOE possibly using an American-"
-            f"exercise model while ours is European Black-Scholes."
+            f"{dv['n']} contracts with open interest. The OI-weighted ratio is what matters for GEX; the median |ΔGamma| is "
+            f"inflated by illiquid wings whose bid/ask mid is unreliable (see Spread % in the table). A constant IV offset "
+            f"across liquid strikes alongside matching gamma points to a time-to-expiry convention difference rather than noise."
         )
 
     if contracts is not None and not contracts.empty:
         st.markdown("**Contract detail — both IVs and both Greek sets (top 40 by open interest)**")
-        cols = ["Expiration", "Strike", "OptionType", "OpenInterest", "Bid", "Ask", "IV_cboe", "IV_own",
+        cols = ["Expiration", "Strike", "OptionType", "OpenInterest", "Bid", "Ask", "Spread %", "IV_cboe", "IV_own",
                 "dIV", "IV_used_source", "Delta_cboe", "Delta_own", "dDelta", "Gamma_cboe", "Gamma_own", "dGamma_pct"]
+        cols = [c_ for c_ in cols if c_ in contracts.columns]
         cd = contracts.sort_values("OpenInterest", ascending=False).head(40)[cols].copy()
         cd = cd.rename(columns={"dIV": "ΔIV (pts)", "dDelta": "ΔDelta", "dGamma_pct": "ΔGamma %",
                                 "IV_used_source": "Own Greeks used IV"})
         st.dataframe(cd.round(4), hide_index=True, use_container_width=True)
     elif contracts is None:
         st.caption("Contract-level table needs live data; not stored in the snapshot.")
+
+    # ---- 8. Raw walls --------------------------------------------------------
+    if has_narr and view.get("raw_walls_own"):
+        with st.expander("Raw walls (unfiltered by spot, diagnostic)"):
+            st.caption("Can surface the at-the-money strike on both sides, since ATM gamma is naturally largest — real information, just not directional.")
+            rw = view["raw_walls_own"]
+            w1, w2 = st.columns(2)
+            with w1:
+                st.write("**Call walls (largest CallGEX):**")
+                st.table(pd.DataFrame(rw["call_walls"], columns=["Strike", "GEX"]))
+            with w2:
+                st.write("**Put walls (largest |PutGEX|):**")
+                st.table(pd.DataFrame(rw["put_walls"], columns=["Strike", "GEX"]))
 
 
 with gex_alt_tab:
@@ -1787,26 +2057,42 @@ with gex_alt_tab:
         "from CBOE's free delayed-quote feed; expected range from GVZ. CBOE's own Greeks and our Black-Scholes "
         "Greeks are shown separately so you can see where they deviate. **Data limits:** quotes are delayed "
         "(~15 min) and open interest is the *previous day's* figure, so intraday GEX is an estimate. "
-        "**Verification status:** the CBOE feed layout is coded from knowledge of that public endpoint and has "
-        "not yet been confirmed against a live response — if the fetch below fails, the error text shows exactly "
-        "what came back."
+        "**Cadence:** the option-chain/GEX snapshot follows the original GEX timing (10-min cache; refresh button); "
+        "the GLD→spot basis is captured separately every 15 min."
     )
 
     ac1, ac2, ac3 = st.columns([1, 2, 1])
     alt_sym = ac1.text_input("Underlying", value="GLD", key="galt_sym").upper().strip() or "GLD"
-    alt_basis_label = ac2.radio(
-        "Self-calculated Greeks use",
-        ["Own IV (backed out of bid/ask mid)", "CBOE's IV (isolates formula / time / rate differences)"],
-        key="galt_basis", horizontal=False,
-    )
-    alt_basis = "mid" if alt_basis_label.startswith("Own") else "cboe"
+    _BASIS_OPTS = {
+        "Own IV (backed out of bid/ask mid)": "mid",
+        "Hybrid: own IV where spread ≤ 10% of mid, else CBOE's IV": "hybrid",
+        "CBOE's IV (isolates formula / time / rate differences)": "cboe",
+    }
+    alt_basis_label = ac2.radio("Self-calculated Greeks use", list(_BASIS_OPTS), key="galt_basis")
+    alt_basis = _BASIS_OPTS[alt_basis_label]
     ac3.write("")
-    if ac3.button("\U0001F504 Refresh CBOE data", key="galt_refresh"):
+    if ac3.button("🔄 Refresh chain (GEX cadence)", key="galt_refresh"):
         load_cboe_chain.clear()
         load_gvz.clear()
         st.session_state.pop("galt_fail_until", None)
+    if ac3.button("🔄 Refresh basis (15-min)", key="galt_refresh_basis"):
+        load_basis_live.clear()
+        load_basis_history.clear()
 
-    # --- live fetch (failures are remembered briefly so widget clicks don't each wait on a dead host)
+    # ---- basis (fast cadence) -------------------------------------------------
+    try:
+        live_pt = load_basis_live()
+    except Exception:
+        live_pt = None
+    try:
+        basis_hist = load_basis_history()
+    except Exception:
+        basis_hist = []
+    stable_oz = load_stable_oz_per_share() if alt_sym == "GLD" else None
+    basis_choice = (gld_basis.choose_basis(live_pt, basis_hist, stable_oz) if alt_sym == "GLD"
+                    else {"spot_per_gld": None, "source": "none", "point": None, "note": "spot-gold conversion only applies to GLD"})
+
+    # ---- chain (GEX cadence); failures remembered briefly so clicks don't each wait on a dead host
     alt_live, alt_err = None, None
     _now = datetime.now().timestamp()
     if _now < st.session_state.get("galt_fail_until", 0):
@@ -1827,21 +2113,40 @@ with gex_alt_tab:
         spot_alt = meta["spot"]
         rf, rf_note = load_risk_free()
         gvz_val = load_gvz()
+        avg_vol = load_avg_volume_10d(alt_sym)
         chain_alt = gex_alt.add_time_to_expiry(raw_df, meta.get("asof_utc"))
         enr = gex_alt.enrich_chain(chain_alt, spot_alt, rf, alt_basis)
         exp_tbl = gex_alt.expiry_table(enr)
 
         asof_iso = meta["asof_utc"].isoformat() if meta.get("asof_utc") else None
         when, age = gex_snapshot.describe_age(asof_iso) if asof_iso else ("unknown", "unknown age")
-        st.success(f"Live CBOE data — stamped **{when}** ({age}); source: {meta.get('url')}")
+        st.success(f"Live CBOE chain — stamped **{when}** ({age}); source: {meta.get('url')}")
         if not meta.get("has_cboe_greeks"):
             st.warning("This CBOE response contained no Greeks — the 'CBOE Greeks' side will be empty/zero.")
+        if meta.get("iv_rescaled"):
+            st.caption("CBOE IVs looked like percentages and were rescaled to decimals.")
+
+        # live price vs chain snapshot (same idea and 0.5% threshold as the original tab)
+        _lp = (live_pt or {}).get("gld") if (live_pt or {}).get("gld_age_min") is not None and live_pt["gld_age_min"] <= gld_basis.FRESH_MINUTES else None
+        if alt_sym == "GLD" and _lp:
+            dev = abs(_lp - spot_alt) / spot_alt * 100
+            if dev >= 0.5:
+                st.warning(
+                    f"⚠️ Live {alt_sym} ({_lp:.2f}) has moved {dev:.2f}% from this chain snapshot's spot ({spot_alt:.2f}) — "
+                    f"a real move since the options data was stamped, not just refresh lag. Strikes don't move, but which side "
+                    f"of price each wall now sits on can have changed; read the levels relative to the live price."
+                )
+            else:
+                st.caption(f"Live {alt_sym} vs chain snapshot: {dev:.2f}% apart — within normal delay.")
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric(f"{alt_sym} (CBOE)", f"{spot_alt:,.2f}")
         m2.metric("GVZ", f"{gvz_val:.2f}" if gvz_val is not None else "n/a")
         m3.metric("CBOE iv30 (raw, as published)", f"{float(meta['iv30']):.4g}" if meta.get("iv30") not in (None, "") else "n/a")
         m4.metric("Risk-free used", f"{rf*100:.2f}%", help=rf_note)
+
+        with st.expander("GLD → spot-gold basis (15-minute capture) and spot reconciliation", expanded=True):
+            _basis_panel(basis_choice, live_pt, basis_hist, stable_oz, chain_spot=spot_alt)
 
         if exp_tbl.empty:
             st.warning("No unexpired expirations in the CBOE response.")
@@ -1867,11 +2172,13 @@ with gex_alt_tab:
                 st.dataframe(exp_tbl[["Expiration", "DTE_label", "TotalOI", "Contracts"]].rename(
                     columns={"DTE_label": "DTE"}), hide_index=True, use_container_width=True)
 
-            # remember this pull as the last good one (once per CBOE timestamp / basis)
+            # remember this pull as the last good one (once per CBOE timestamp / basis choice)
             _save_tag = f"{alt_sym}|{asof_iso}|{alt_basis}"
             if st.session_state.get("galt_saved_for") != _save_tag:
                 try:
-                    _payload = gex_alt.build_snapshot_payload(alt_sym, spot_alt, meta, enr, rf, rf_note, gvz_val, alt_basis)
+                    _payload = gex_alt.build_snapshot_payload(
+                        alt_sym, spot_alt, meta, enr, rf, rf_note, gvz_val, alt_basis,
+                        avg_volume=avg_vol, basis=(basis_choice.get("point") if basis_choice else None))
                     if gex_snapshot.save_payload(f"{alt_sym}|alt", _payload):
                         st.session_state["galt_saved_for"] = _save_tag
                 except Exception as e:
@@ -1881,10 +2188,11 @@ with gex_alt_tab:
                 st.warning("No contracts with open interest in that selection.")
             else:
                 st.caption(f"Selection: **{alt_view['label']}** — {alt_view['n_contracts']} contracts, open interest {alt_view['total_oi']:,.0f}.")
-                _render_gex_alt_view(alt_view, spot_alt, gvz_val, alt_sym, contracts=alt_view["selection_df"])
+                _render_gex_alt_view(alt_view, spot_alt, gvz_val, alt_sym, contracts=alt_view["selection_df"],
+                                     basis=basis_choice, stable_oz=stable_oz, avg_volume=avg_vol)
 
     else:
-        # --- fallback: last successful CBOE pull
+        # --- fallback: last successful CBOE pull (chain), with the CURRENT basis (fast cadence)
         snap, origin = gex_snapshot.load_best_payload(f"{alt_sym}|alt", load_remote_gex_store())
         st.error(f"Live CBOE fetch failed: {alt_err}")
         if snap is None or not snap.get("views"):
@@ -1896,11 +2204,14 @@ with gex_alt_tab:
             when, age = gex_snapshot.describe_age(snap.get("saved_utc"))
             cb_when, _ = gex_snapshot.describe_age(snap.get("asof_cboe_utc")) if snap.get("asof_cboe_utc") else ("unknown", "")
             st.warning(
-                f"Showing the LAST SUCCESSFUL pull, saved **{when}** ({age}); CBOE data stamp {cb_when}; "
-                f"stored {origin}. Nothing below is live. Spot in this snapshot: {snap['spot']:,.2f}."
+                f"Showing the LAST SUCCESSFUL chain pull, saved **{when}** ({age}); CBOE data stamp {cb_when}; "
+                f"stored {origin}. The chain is not live. Spot in this snapshot: {snap['spot']:,.2f}."
             )
+            with st.expander("GLD → spot-gold basis (15-minute capture) and spot reconciliation", expanded=True):
+                _basis_panel(basis_choice, live_pt, basis_hist, stable_oz)
             vkeys = list(snap["views"].keys())
             vlabels = [snap["views"][k]["label"] for k in vkeys]
             vpick = st.selectbox("Stored view", vlabels, index=0, key="galt_snap_view")
             sv = snap["views"][vkeys[vlabels.index(vpick)]]
-            _render_gex_alt_view(sv, snap["spot"], snap.get("gvz"), alt_sym, contracts=None)
+            _render_gex_alt_view(sv, snap["spot"], snap.get("gvz"), alt_sym, contracts=None,
+                                 basis=basis_choice, stable_oz=stable_oz, avg_volume=snap.get("avg_volume_10d"))
