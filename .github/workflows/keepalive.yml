@@ -1,0 +1,75 @@
+name: Keep Streamlit awake
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours (UTC)
+  workflow_dispatch:         # lets you run it manually from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Visit app
+        run: |
+          python - <<'EOF'
+          import sys
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+          URL = "https://handofmidas.streamlit.app/"
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page()
+
+              # Streamlit keeps a websocket open, so "networkidle" never fires. Wait for the page itself instead.
+              try:
+                  page.goto(URL, wait_until="domcontentloaded", timeout=90000)
+              except PWTimeout:
+                  print("Page was slow to load, carrying on anyway")
+
+              page.wait_for_timeout(8000)
+
+              # If the app is asleep, click the wake-up button (text has varied, so match loosely)
+              woke = False
+              for label in ("Yes, get this app back up!", "get this app back up"):
+                  btn = page.get_by_role("button", name=label)
+                  if btn.count() > 0:
+                      print("App was asleep, waking it up...")
+                      btn.first.click()
+                      woke = True
+                      break
+              if woke:
+                  page.wait_for_timeout(60000)   # give it time to boot
+
+              # Stay on the page a bit so it counts as a real visit
+              page.wait_for_timeout(15000)
+
+              title = page.title()
+              body = page.inner_text("body")[:300].replace("\n", " ")
+              print("Title:", title)
+              print("Page text:", body)
+              page.screenshot(path="visit.png")
+              browser.close()
+
+              if not title:
+                  print("No page title, the visit probably failed")
+                  sys.exit(1)
+          EOF
+
+      - name: Save screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visit-screenshot
+          path: visit.png
+          if-no-files-found: ignore
