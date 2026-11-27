@@ -1,5 +1,4 @@
 timestamp_utc,top_state,top_prob,prob_declining,prob_range,prob_rising
-2026-11-20T08:54:21+00:00,Range,0.9949,0.0042,0.9949,0.0009
 2026-11-20T17:33:50+00:00,Range,0.9805,0.0195,0.9805,0.0
 2026-11-20T23:22:27+00:00,Range,0.9882,0.0118,0.9882,0.0
 2026-11-21T04:11:07+00:00,Range,0.9884,0.0116,0.9884,0.0
@@ -14,3 +13,4 @@ timestamp_utc,top_state,top_prob,prob_declining,prob_range,prob_rising
 2026-11-26T08:45:55+00:00,Declining,1.0,1.0,0.0,0.0
 2026-11-26T18:41:09+00:00,Declining,1.0,1.0,0.0,0.0
 2026-11-27T01:58:13+00:00,Declining,1.0,1.0,0.0,0.0
+2026-11-27T10:38:34+00:00,Declining,1.0,1.0,0.0,0.0
